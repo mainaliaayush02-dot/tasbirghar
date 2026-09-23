@@ -8,6 +8,7 @@
  *   studios/{studioId}/packages/{packageId}
  *   studios/{studioId}/availability/{YYYY-MM-DD}
  *   studioSlugs/{slug}                             slug → studioId uniqueness lock
+ *   photographerApplications/{uid}                 one application per user (server-only)
  *   bookings/{bookingId}
  *   reviews/{bookingId}                            one review per booking
  *
@@ -41,6 +42,7 @@ export type UserRole = "customer" | "photographer" | "admin";
  * in rules and server code always use the claim.
  */
 export interface UserDoc extends Timestamps {
+  uid: string;
   role: UserRole;
   displayName: string;
   email: string | null;
@@ -79,6 +81,14 @@ export interface StudioDoc extends Timestamps {
   phone: string;
   email: string | null;
   location: StudioLocation;
+  website: string | null;
+  /** Instagram handle without "@". */
+  instagram: string | null;
+  yearsOfExperience: number | null;
+  /** Free text: team members / roles. */
+  team: string | null;
+  /** Free text: what makes the studio different. */
+  highlights: string | null;
   /** Also the "service areas" filter; bounded by the category list. */
   categories: CategorySlug[];
   profileImage: MediaAsset | null;
@@ -258,6 +268,40 @@ export interface ReviewDoc extends Timestamps {
   comment: string;
   status: ReviewStatus;
   studioReply: string | null;
+}
+
+/* ------------------------------------------------ photographer onboarding */
+
+export type ApplicationStatus = "pending" | "approved" | "rejected";
+
+/**
+ * photographerApplications/{uid} — keyed by applicant uid (one per user;
+ * resubmission allowed only after rejection). Read and written exclusively
+ * by server code; clients have no Firestore access to this collection.
+ */
+export interface PhotographerApplicationDoc {
+  applicantUid: string;
+  /** From the verified Firebase Auth record, not from the form. */
+  applicantEmail: string | null;
+  fullName: string;
+  phone: string;
+  businessName: string;
+  city: LocationSlug;
+  area: string;
+  categories: CategorySlug[];
+  description: string;
+  yearsOfExperience: number;
+  instagram: string | null;
+  website: string | null;
+  portfolioIntro: string;
+  status: ApplicationStatus;
+  submittedAt: Timestamp;
+  updatedAt: Timestamp;
+  reviewedAt: Timestamp | null;
+  reviewedBy: string | null;
+  approvedAt: Timestamp | null;
+  approvedBy: string | null;
+  rejectionReason: string | null;
 }
 
 /** studioSlugs/{slug} — reserved atomically with the studio to keep slugs unique. */

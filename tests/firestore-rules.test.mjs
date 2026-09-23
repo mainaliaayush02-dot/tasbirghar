@@ -166,6 +166,30 @@ const reviewDoc = (bookingId, customerId, studioId, status) => ({
   updatedAt: "2026-01-01",
 });
 
+const applicationDoc = (uid, status) => ({
+  applicantUid: uid,
+  applicantEmail: `${uid}@example.com`,
+  fullName: "Applicant",
+  phone: "+9779800000000",
+  businessName: "Applicant Studio",
+  city: "kathmandu",
+  area: "Baneshwor",
+  categories: ["newborn"],
+  description: "Newborn photographer with a home studio.",
+  yearsOfExperience: 3,
+  instagram: null,
+  website: null,
+  portfolioIntro: "Soft natural light newborn work.",
+  status,
+  submittedAt: "2026-01-01",
+  updatedAt: "2026-01-01",
+  reviewedAt: null,
+  reviewedBy: null,
+  approvedAt: null,
+  approvedBy: null,
+  rejectionReason: null,
+});
+
 /* -------------------------------------------------------------------- setup */
 
 let env;
@@ -211,6 +235,8 @@ beforeEach(async () => {
       ["reviews/b1", reviewDoc("b1", "alice", "studioA", "published")],
       ["reviews/b2", reviewDoc("b2", "bob", "studioB", "pending_moderation")],
       ["platform/settings", { defaultCommissionRateBps: 800 }],
+      ["photographerApplications/alice", applicationDoc("alice", "pending")],
+      ["photographerApplications/bob", applicationDoc("bob", "rejected")],
     ];
     for (const [path, data] of seed) await setDoc(doc(db, path), data);
   });
@@ -674,3 +700,40 @@ describe("admin (read-only in rules; mutations are server-side)", () => {
   test("cannot read undeclared collections", () =>
     assertFails(getDoc(ref(admin(), "platform/settings"))));
 });
+
+/* ------------------------------------------- photographer applications (P2) */
+
+describe("photographerApplications are server-only", () => {
+  const approved = { status: "approved", approvedBy: "alice", approvedAt: "2026-02-01" };
+
+  test("applicant cannot read, create, or self-approve their application", async () => {
+    const db = customer("alice");
+    await assertFails(getDoc(ref(db, "photographerApplications/alice")));
+    await assertFails(setDoc(ref(db, "photographerApplications/alice"), applicationDoc("alice", "approved")));
+    await assertFails(updateDoc(ref(db, "photographerApplications/alice"), approved));
+    await assertFails(deleteDoc(ref(db, "photographerApplications/alice")));
+    await assertFails(setDoc(ref(customer("carol"), "photographerApplications/carol"), applicationDoc("carol", "pending")));
+  });
+  test("other users and photographers cannot read or modify applications", async () => {
+    await assertFails(getDoc(ref(customer("bob"), "photographerApplications/alice")));
+    await assertFails(getDocs(collection(customer("bob"), "photographerApplications")));
+    await assertFails(updateDoc(ref(photographer(), "photographerApplications/alice"), approved));
+    await assertFails(getDoc(ref(anon(), "photographerApplications/alice")));
+  });
+  test("admin cannot approve via client SDK (approval is a server route)", async () => {
+    await assertFails(updateDoc(ref(admin(), "photographerApplications/alice"), approved));
+    await assertFails(setDoc(ref(admin(), "photographerApplications/alice"), applicationDoc("alice", "approved")));
+  });
+  test("approval side effects cannot be forged: role mirror and studioId stay server-only", async () => {
+    await assertFails(updateDoc(ref(customer("alice"), "users/alice"), { role: "photographer" }));
+    await assertFails(updateDoc(ref(customer("alice"), "users/alice"), { studioId: "studioA" }));
+    await assertFails(setDoc(ref(customer("alice"), "studios/aliceStudio"), studioDoc("alice", "alice", "draft", null)));
+    await assertFails(setDoc(ref(customer("alice"), "studioSlugs/alice"), { studioId: "aliceStudio" }));
+  });
+  test("server-written Phase 2 studio fields are not client-writable", async () => {
+    for (const field of ["website", "instagram", "yearsOfExperience", "team", "highlights"]) {
+      await assertFails(updateDoc(ref(photographer(), "studios/studioA"), { [field]: "x" }));
+    }
+  });
+});
+

@@ -2,6 +2,9 @@
  * Photography categories. The slug is the stable identifier stored in
  * Firestore and used in URLs (`/categories/[category]`) — never rename a slug
  * once live; add a redirect instead.
+ *
+ * To expand (wedding, pre-wedding, events, product, fashion, commercial), add
+ * entries here — validation, forms and filters all derive from this list.
  */
 export const PHOTOGRAPHY_CATEGORIES = [
   { slug: "newborn", name: "Newborn Photography" },

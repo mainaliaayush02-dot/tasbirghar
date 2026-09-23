@@ -6,6 +6,7 @@ export const collections = {
   users: "users",
   studios: "studios",
   studioSlugs: "studioSlugs",
+  photographerApplications: "photographerApplications",
   bookings: "bookings",
   reviews: "reviews",
 } as const;

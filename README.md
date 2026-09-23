@@ -25,6 +25,7 @@ npm run dev                  # http://localhost:3000
 | `NEXT_PUBLIC_FIREBASE_*` | Firebase console → Project settings → Your apps → Web app config |
 | `NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME` | Cloudinary console → Dashboard |
 | `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET` | Cloudinary console → Settings → API Keys (**server only, never `NEXT_PUBLIC_`**) |
+| `FIREBASE_ADMIN_PROJECT_ID`, `FIREBASE_ADMIN_CLIENT_EMAIL`, `FIREBASE_ADMIN_PRIVATE_KEY` | Firebase console → Project settings → Service accounts → Generate new private key (**server only**). Paste the key on one line with `\n` escapes, in double quotes. |
 | `NEXT_PUBLIC_APP_URL` | `http://localhost:3000` locally, or the production domain on Vercel |
 
 Never commit `.env.local`. In production, set the same variables in Vercel → Project → Settings → Environment Variables.
@@ -42,6 +43,36 @@ With the Cloudinary variables set, run `npm run dev` and open <http://localhost:
 | `npm run start` | Serve the production build |
 | `npm run lint` | ESLint |
 | `npm run test:rules` | Firestore security rules tests (needs the Firestore emulator on 127.0.0.1:8080) |
+| `npm run test:api` | Phase 2 API acceptance and security tests (needs the emulators and an emulator-wired app; see below) |
+| `npm run admin:grant -- --email <email> --yes` | Grant the admin role to an existing user (add `--revoke` to remove it) |
+
+## First admin
+
+1. Sign up at `/signup` with the admin's email.
+2. With the Firebase Admin credentials in `.env.local`, run `npm run admin:grant -- --email you@example.com --yes`.
+3. Sign in again and open `/admin`.
+
+There is intentionally no web endpoint that grants admin.
+
+## Testing against emulators
+
+The API tests never touch production Firebase. They use a `demo-` project on the emulators. Uploads go to Cloudinary and are deleted when the tests finish.
+
+```bash
+# terminal 1: emulators (Firestore 8080, Auth 9099)
+npx firebase-tools emulators:start --only firestore,auth --project demo-tasbirghar
+
+# terminal 2: app wired to the emulators
+export NEXT_PUBLIC_FIREBASE_PROJECT_ID=demo-tasbirghar FIREBASE_ADMIN_PROJECT_ID=demo-tasbirghar \
+  NEXT_PUBLIC_FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099 FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099 \
+  FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 NEXT_PUBLIC_APP_URL=http://localhost:3124
+npm run build && npx next start -p 3124
+
+# terminal 3: same exports, then
+npm run test:api
+```
+
+Rebuild without those variables before deploying, because `NEXT_PUBLIC_*` values are baked in at build time.
 
 ## Firestore rules
 

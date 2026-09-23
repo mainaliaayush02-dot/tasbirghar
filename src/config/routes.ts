@@ -18,17 +18,24 @@ export const routes = {
     bookings: "/account/bookings",
   },
 
+  login: "/login",
+  signup: "/signup",
+  becomePhotographer: "/become-a-photographer",
+
   dashboard: {
     root: "/dashboard",
-    profile: "/dashboard/profile",
+    studio: "/dashboard/studio",
     portfolio: "/dashboard/portfolio",
+    gallery: "/dashboard/gallery",
     packages: "/dashboard/packages",
     availability: "/dashboard/availability",
+    verification: "/dashboard/verification",
     bookings: "/dashboard/bookings",
   },
 
   admin: {
     root: "/admin",
+    applications: "/admin/applications",
     studios: "/admin/studios",
     users: "/admin/users",
     bookings: "/admin/bookings",
@@ -39,6 +46,7 @@ export const routes = {
 /** Path prefixes that must never be indexed and will require auth. */
 export const PRIVATE_PATH_PREFIXES = [
   "/account",
+  "/become-a-photographer",
   "/dashboard",
   "/admin",
   "/api",

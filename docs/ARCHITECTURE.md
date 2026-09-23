@@ -149,7 +149,7 @@ Browser                         Next.js server                         Cloudinar
 - **The browser pre-flight** (`preflightImageFile`: magic bytes and size) only gives instant feedback. It is not a security boundary.
 - **Unconfirmed uploads**, where the browser uploads and never calls confirm, are possible. They're harmless orphans that nothing references. A periodic cleanup job can remove assets under `tasbirghar/` that have no Firestore reference.
 
-In the dev test (`/dev/cloudinary-test`), the `sign`, `confirm` and `DELETE` endpoints live under `/api/dev/cloudinary-test`. Phase 2 production endpoints (`/api/media/sign`, `/api/media/confirm`, `DELETE /api/media`) reuse the same library functions and add Firebase ID-token verification and studio ownership checks.
+Production endpoints are `/api/media/sign` and `/api/media/confirm`, plus `DELETE` on the portfolio or gallery item. They reuse the same library functions and add session verification, the photographer claim and a studio ownership check. The server derives the folder from the verified studio and target (`portfolio`, `gallery` + kind, `profile`, `cover`), never from client input. Confirm stores the record under the asset's UUID, so the same upload can't be recorded twice. A duplicate confirm is rejected without deleting the asset. The development-only test endpoints remain under `/api/dev/cloudinary-test`.
 
 ---
 
@@ -181,16 +181,97 @@ Design notes:
 
 ---
 
-## 5. User roles and route areas
+## 5. Authentication, roles and onboarding (Phase 2)
 
-| Role | Area | Routes (planned) |
+### Sessions
+
+```
+Browser (Firebase Auth, in-memory only)        Next.js server (Admin SDK)
+  sign up / log in with email + password
+  getIdToken() ───── POST /api/auth/session ──▶ verifyIdToken(checkRevoked) + auth_time ≤ 5 min
+                                                createSessionCookie (5 days)
+  ◀──────────── Set-Cookie: __session (httpOnly, SameSite=Lax, Secure in prod)
+                                                first sign-in: create users/{uid} (uid + email from token)
+  signOut() locally — the cookie is now the only session
+  DELETE /api/auth/session ───────────────────▶ clear cookie (logout)
+```
+
+- **`getCurrentUser()`** (`src/lib/auth/current-user.ts`, memoized per request) verifies the session cookie, checking revocation, then loads the Firebase user so **custom claims are always current**. A role granted or revoked takes effect on the next request, with no need to sign in again.
+- **`requireUser(area, path)`** is the authorization gate for pages. Signed-out users are sent to `/login?next=…`, a customer opening `/dashboard` is sent to `/become-a-photographer`, and non-admins get a 404 on `/admin`. API routes use **`requireApiUser(...roles)`**.
+- **`src/proxy.ts`** only redirects obviously signed-out visitors (no cookie) away from private areas. It is **not** the security boundary.
+- **CSRF:** the cookie is SameSite=Lax, and every mutating API request must also carry an `Origin` matching the host.
+- The browser never writes Firestore directly. Every Phase 2 mutation goes through a validated API route using the Admin SDK. The deployed rules stay as defense in depth.
+
+### Roles
+
+| Role | How it is granted | Areas |
 | --- | --- | --- |
-| customer | `(customer)` | `/account`, `/account/bookings` |
-| photographer | `(studio)` | `/dashboard`, `/dashboard/profile`, `/portfolio`, `/packages`, `/availability`, `/bookings` |
-| admin | `(admin)` | `/admin`, `/admin/studios`, `/users`, `/bookings`, `/reviews` |
-| public | `(public)` | `/`, `/photographers`, `/photographers/[slug]`, `/categories/[category]`, `/locations/[location]`, `/search` |
+| customer | Default (no claim) | `/account`, `/become-a-photographer` |
+| photographer | An admin approves an application (`POST /api/admin/applications/{uid}`) | `/dashboard/*`, `/account` |
+| admin | `npm run admin:grant` (local script with service-account credentials) | `/admin/*`, `/account` |
 
-All paths come from `src/config/routes.ts`. The private areas are `noindex` and disallowed in `robots.txt`. They currently hold only placeholder pages. **Auth gating arrives in Phase 2**, planned as a Firebase session cookie (created server-side with the Admin SDK) checked in the group layouts and in route handlers.
+The custom claim `role` is authoritative. `users/{uid}.role` is only a mirror, and every code path that changes the claim updates the mirror at the same time.
+
+### Photographer onboarding
+
+1. **Apply.** A customer submits `/become-a-photographer`, which calls `POST /api/photographer-applications`. The server stores `photographerApplications/{uid}` with status `pending`, taking the applicant uid and email from the session. A customer can apply again only after a rejection.
+2. **Review.** An admin opens `/admin/applications` and approves or rejects, which calls `POST /api/admin/applications/{uid}` (live `admin` claim required; admins can't review their own application). Approval:
+   - sets the claim `role: "photographer"`
+   - in one transaction, sets the application to `approved` with `approvedAt`/`approvedBy`, and sets the `users/{uid}.role` mirror to `photographer`
+   - rolls the claim back if that transaction fails
+3. **Create the studio.** The photographer submits `/dashboard/studio`, which calls `POST /api/studios`. In one transaction the server:
+   - normalizes the slug and reserves `studioSlugs/{slug}`
+   - creates `studios/{id}` with `ownerId` taken from the session, `commissionRateBps: 800`, `listingStatus: "draft"`, `verificationStatus: "unverified"`, zeroed `stats`, and no media
+   - sets `users/{uid}.studioId`
+
+   The schema rejects `ownerId`, commission, status and media fields if the browser sends them. MVP limit: one studio per photographer.
+4. **Build the listing** in the dashboard: profile and cover images, portfolio, studio photos, and packages.
+
+### Admin bootstrap (first admin)
+
+There is no HTTP endpoint that grants admin.
+
+1. The person who will be admin signs up normally at `/signup`.
+2. On a machine that has the Firebase Admin service-account credentials in `.env.local`, run `npm run admin:grant -- --email you@example.com --yes`.
+3. The script sets `role: "admin"`, updates the mirror, and revokes existing sessions. The admin then signs in again and opens `/admin`.
+
+To remove admin, run `npm run admin:grant -- --email you@example.com --revoke --yes`.
+
+### API routes
+
+| Route | Who | Purpose |
+| --- | --- | --- |
+| `POST/DELETE /api/auth/session` | anyone with a fresh ID token / signed-in user | create or clear the session; first-login `users/{uid}` |
+| `PATCH /api/account` | signed-in user | `displayName`, `phone` only |
+| `POST /api/photographer-applications` | customer | submit an application |
+| `POST /api/admin/applications/{uid}` | admin | approve or reject |
+| `POST /api/studios` | photographer | create own studio |
+| `PUT /api/studios/{id}` | owner | update studio profile |
+| `POST /api/media/sign` / `POST /api/media/confirm` | owner | signed direct upload; confirm writes the media record (portfolio, gallery, profile, cover) |
+| `PATCH/DELETE /api/studios/{id}/{portfolio\|gallery}/{itemId}` | owner | caption, category, order, featured, or delete (deletes the asset too) |
+| `POST /api/studios/{id}/packages`, `PUT/DELETE …/packages/{packageId}` | owner | packages (rupees in, integer paisa stored); keeps `startingPrice` in sync |
+
+Ownership is checked with `assertStudioOwner(studioId, sessionUid)`. Admins are **not** owners, so moderation will get its own routes.
+
+### Validation
+
+`src/lib/validation` is a small, dependency-free schema layer shared by routes (the authority) and forms (the same limits in the UI):
+- **Unknown fields are rejected** (422), which is what stops `ownerId`, `commissionRateBps`, `role`, `status` and `image` from being smuggled in.
+- **Text** has length limits and control characters are stripped.
+- **Formats:** Nepal phone numbers are normalized to `+977…`; URLs must be http(s) and are normalized; Instagram handles are normalized.
+- **Allowed values:** categories and cities come from `src/config`; slugs are normalized, with reserved words blocked.
+- **Numbers:** prices are whole rupees from Rs. 500 to Rs. 10,00,000.
+- **Other limits:** 64 KB maximum request body; up to 60 portfolio photos, 30 studio photos and 20 packages per studio.
+
+### Route areas
+
+| Area | Routes |
+| --- | --- |
+| `(public)` | `/` (later `/photographers`, `/categories/[category]`, `/locations/[location]`, `/search`) |
+| `(auth)` | `/login`, `/signup` (noindex) |
+| `(customer)` | `/account`, `/become-a-photographer` |
+| `(studio)` | `/dashboard`, `/dashboard/studio`, `/portfolio`, `/gallery`, `/packages`, `/availability` (placeholder), `/verification` |
+| `(admin)` | `/admin`, `/admin/applications` |
 
 ---
 
@@ -241,7 +322,10 @@ The platform default is `DEFAULT_COMMISSION_RATE_BPS = 800`. A negotiated per-st
 | `CLOUDINARY_API_SECRET` | **server only** | Signed Cloudinary API calls. Never prefix it with `NEXT_PUBLIC_`. |
 | `NEXT_PUBLIC_APP_URL` | public | Canonical URLs, `metadataBase`, sitemap and robots |
 
-Phase 2 will add Firebase Admin credentials (`FIREBASE_ADMIN_*`, server only). Local values go in `.env.local`, which is gitignored. Production and preview values go in Vercel project settings. Only `.env.example` is committed.
+| `FIREBASE_ADMIN_PROJECT_ID`, `FIREBASE_ADMIN_CLIENT_EMAIL`, `FIREBASE_ADMIN_PRIVATE_KEY` | **server only** | Admin SDK service account (sessions, claims, trusted writes) |
+| `FIREBASE_AUTH_EMULATOR_HOST`, `FIRESTORE_EMULATOR_HOST`, `NEXT_PUBLIC_FIREBASE_AUTH_EMULATOR_HOST` | local testing only | Point the app at emulators. Never set these in production. |
+
+Local values go in `.env.local`, which is gitignored. Production and preview values go in Vercel project settings. Only `.env.example` is committed.
 
 ---
 
@@ -264,7 +348,8 @@ Phase 2 will add Firebase Admin credentials (`FIREBASE_ADMIN_*`, server only). L
 4. **No anonymous uploads.** The only signing endpoint today, `/api/dev/cloudinary-test/sign`, returns 404 unless `NODE_ENV === "development"` (verified on a production build), and signs only for `tasbirghar/dev-tests/`. Production signing endpoints must verify the Firebase ID token and studio ownership before signing.
 5. **Destructive media operations** are restricted to public IDs under `tasbirghar/` and are always authorized by the caller.
 6. **Uploads are validated without trusting the browser.** Cloudinary enforces the signed `allowed_formats` on the decoded file, and the confirm step re-checks format, size and `asset_folder` from the Cloudinary Admin API.
-7. **Private areas** are `noindex` and disallowed in robots. Auth gating comes in Phase 2.
+7. **Private areas** are `noindex`, disallowed in robots, and gated server-side by `requireUser` and `requireApiUser` using live custom claims (see section 5).
+8. **Sessions** are httpOnly cookies, not readable from JavaScript (verified in the browser test). Client Firebase Auth uses in-memory persistence only. ID tokens older than 5 minutes can't be exchanged for a session.
 
 ### Firestore rules: what clients may do
 
@@ -284,4 +369,4 @@ Notes for later phases:
 - Owners control availability `slots`. Booking code must re-check slot conflicts against `bookings` server-side and never trust a slot's `status`.
 - `bookings.studioOwnerId` is denormalized for rules. Any future studio ownership transfer must update it.
 - The `users/{uid}.email` mirror is client-set at sign-up. Server code must use the email from the verified ID token.
-- Field **types and sizes** for profile text (for example `categories` values) aren't validated in rules yet. Validate them in the Phase 2 forms and server routes.
+- Field **types and sizes** for profile text aren't validated in rules. Phase 2 UI writes go through validated server routes, but an owner using the client SDK directly could still write oversized or odd values into the allowlisted fields of their **own** studio, such as `description` or `categories`. That affects only their own listing. Closing it means either removing those client-write allowances (the server now handles all writes) or adding type checks to the rules, which is a candidate for Phase 3.
