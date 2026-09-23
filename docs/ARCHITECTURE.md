@@ -266,9 +266,22 @@ Phase 2 will add Firebase Admin credentials (`FIREBASE_ADMIN_*`, server only). L
 6. **Uploads are validated without trusting the browser.** Cloudinary enforces the signed `allowed_formats` on the decoded file, and the confirm step re-checks format, size and `asset_folder` from the Cloudinary Admin API.
 7. **Private areas** are `noindex` and disallowed in robots. Auth gating comes in Phase 2.
 
-The rules in `firestore.rules` have been reviewed by hand but **not yet validated or deployed**. The Firestore database (production mode, `asia-south1`) currently runs Firebase's default deny-all rules. Before deploying:
+### Firestore rules: what clients may do
 
-1. Install **Java 21 or newer** (firebase-tools 15 requires it for the emulator), for example Eclipse Temurin 21 from adoptium.net.
-2. Log the Firebase CLI in with an account that has access to `tasbirghar-f285b` (`npx firebase-tools login:add`, then `login:use`).
-3. Run `npx firebase-tools emulators:start --only firestore --project tasbirghar-f285b`, which compiles the rules, and test the allow and deny cases for each collection.
-4. Deploy with `npx firebase-tools deploy --only firestore:rules --project tasbirghar-f285b`.
+`firestore.rules` is deny-by-default and is covered by `tests/firestore-rules.test.mjs` (86 emulator tests). Client updates use **field allowlists**, so any field not listed is immutable from the client SDK.
+
+| Actor | Allowed | Everything else |
+| --- | --- | --- |
+| Anyone (signed out) | Read published studios and their portfolio, gallery, packages and availability. `get` a single `studioSlugs/{slug}`. Read published reviews. | Denied, including draft studios and listing slugs |
+| Signed-in user (customer) | Create own `users/{uid}` with `role: "customer"`, `studioId: null`, `photo: null`. Read own user doc. Update own `displayName`, `phone`, `updatedAt`. Read own bookings and own reviews. | Denied |
+| Photographer (claim, owner of the studio) | Update own studio: `businessName`, `description`, `phone`, `email`, `location`, `categories`, `facilities`, `props`, `updatedAt`. Portfolio: update `caption`, `category`, `sortOrder`, `isFeatured`, or delete. Gallery: update `caption`, `sortOrder`, or delete. Packages: create with `images: []`, NPR and an integer price; update details and price; delete. Availability: create, update `isClosed`/`slots`, delete. Read bookings where `studioOwnerId` is the photographer's uid. | Denied, including every other studio |
+| Admin (claim) | **Read** users, studios (including drafts) and their subcollections, bookings and reviews. | **All client writes denied.** Admin mutations (moderation, commission, role grants) go through server routes using the Admin SDK. |
+| Server (Admin SDK) | Everything, since it bypasses rules: studio creation and slug reservation, statuses, commission, stats, `startingPrice`, all `MediaAsset` fields, portfolio and gallery creation, package images, role claims and mirror, bookings, reviews. | n/a |
+
+Run the tests with a Firestore emulator running (`npx firebase-tools emulators:start --only firestore --project tasbirghar-f285b`), then `npm run test:rules`. Deploy with `npx firebase-tools deploy --only firestore:rules --project tasbirghar-f285b`, and only after the tests pass.
+
+Notes for later phases:
+- Owners control availability `slots`. Booking code must re-check slot conflicts against `bookings` server-side and never trust a slot's `status`.
+- `bookings.studioOwnerId` is denormalized for rules. Any future studio ownership transfer must update it.
+- The `users/{uid}.email` mirror is client-set at sign-up. Server code must use the email from the verified ID token.
+- Field **types and sizes** for profile text (for example `categories` values) aren't validated in rules yet. Validate them in the Phase 2 forms and server routes.

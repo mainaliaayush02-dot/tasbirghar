@@ -1,23 +1,21 @@
 rules_version = '2';
 
-// TasbirGhar Firestore rules — Phase 1 DRAFT. Deny by default.
-// Deploy: firebase deploy --only firestore:rules
+// TasbirGhar Firestore rules. Deny by default.
+// Tests: npm run test:rules (Firestore emulator). Deploy only after they pass:
+//   npx firebase-tools deploy --only firestore:rules --project tasbirghar-f285b
 // See docs/ARCHITECTURE.md → "Security".
 //
-// Roles come from the Auth custom claim `role` (set only by server code via
-// the Admin SDK). users/{uid}.role is a read-only mirror for the UI: clients
-// may only ever write "customer" there, and can never change it afterwards.
-// Becoming a photographer (or admin) happens server-side, which sets the
-// claim and updates the mirror together.
-//
-// Money-bearing documents (bookings) and verified reviews are written only by
-// trusted server code (Admin SDK bypasses these rules), so clients cannot
-// tamper with prices, commission or review eligibility.
-//
-// Media fields (MediaAsset: users.photo, studio profileImage/coverImage,
-// portfolio/gallery `image`, package `images`) are written only by the server
-// media "confirm" step, which verifies the asset with Cloudinary. Clients can
-// never point a document at an arbitrary (e.g. another studio's) publicId.
+// Principles
+// - Roles come from the Auth custom claim `role` (set only by server code via
+//   the Admin SDK). users/{uid}.role is a read-only mirror for the UI: clients
+//   may only ever create it as "customer" and can never change it.
+// - Sensitive writes happen server-side (Admin SDK bypasses these rules):
+//   studio creation (slug reservation, commission), moderation, bookings,
+//   reviews, and every MediaAsset field (written by the media confirm step
+//   after verifying the asset with Cloudinary).
+// - Admins are READ-ONLY here. Admin mutations go through server routes so
+//   they can be validated and audited.
+// - Client updates use field ALLOWLISTS: any field not listed is immutable.
 
 service cloud.firestore {
   match /databases/{database}/documents {
@@ -26,31 +24,43 @@ service cloud.firestore {
     function isSelf(uid) { return signedIn() && request.auth.uid == uid; }
     function isAdmin() { return signedIn() && request.auth.token.role == 'admin'; }
 
-    function unchanged(fields) {
-      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    function incoming() { return request.resource.data; }
+
+    // The update touches only the given fields.
+    function onlyChanges(fields) {
+      return incoming().diff(resource.data).affectedKeys().hasOnly(fields);
     }
+
+    function isNonNegativeInt(value) { return value is int && value >= 0; }
 
     function studio(studioId) {
       return get(/databases/$(database)/documents/studios/$(studioId)).data;
     }
-    function ownsStudio(studioId) { return signedIn() && studio(studioId).ownerId == request.auth.uid; }
-    function studioIsPublic(studioId) { return studio(studioId).listingStatus == 'published'; }
-    function canManageStudio(studioId) { return ownsStudio(studioId) || isAdmin(); }
+    function ownsStudio(studioId) {
+      return signedIn() && studio(studioId).ownerId == request.auth.uid;
+    }
     function canReadStudioContent(studioId) {
-      return studioIsPublic(studioId) || ownsStudio(studioId) || isAdmin();
+      return studio(studioId).listingStatus == 'published' || ownsStudio(studioId) || isAdmin();
     }
 
     // ---------------------------------------------------------------- users
     match /users/{uid} {
       allow read: if isSelf(uid) || isAdmin();
+
       // Self sign-up always starts as a customer, with no studio or photo.
       allow create: if isSelf(uid)
-        && request.resource.data.role == 'customer'
-        && request.resource.data.studioId == null
-        && request.resource.data.photo == null;
-      allow update: if (isSelf(uid) && unchanged(['role', 'studioId', 'photo', 'createdAt']))
-        || isAdmin();
-      allow delete: if isAdmin();
+        && incoming().keys().hasOnly(['role', 'displayName', 'email', 'phone', 'photo',
+                                      'studioId', 'createdAt', 'updatedAt'])
+        && incoming().role == 'customer'
+        && incoming().studioId == null
+        && incoming().photo == null;
+
+      // Customers edit their own profile text only. role, studioId, photo,
+      // email and timestamps are server-managed.
+      allow update: if isSelf(uid)
+        && onlyChanges(['displayName', 'phone', 'updatedAt']);
+
+      allow delete: if false;
     }
 
     // -------------------------------------------------------------- studios
@@ -65,59 +75,73 @@ service cloud.firestore {
       // commission rate.
       allow create: if false;
 
-      // Owners edit their profile text; moderation, ownership, stats,
-      // commission and media fields are admin/server controlled.
-      allow update: if (signedIn() && resource.data.ownerId == request.auth.uid
-          && unchanged(['ownerId', 'slug', 'verificationStatus', 'listingStatus',
-                        'stats', 'commissionRateBps', 'startingPrice',
-                        'profileImage', 'coverImage', 'createdAt']))
-        || isAdmin();
+      // Owners edit profile text. ownerId, slug, statuses, stats, pricing
+      // summary, commission, currency and media are server/admin controlled.
+      allow update: if signedIn() && resource.data.ownerId == request.auth.uid
+        && onlyChanges(['businessName', 'description', 'phone', 'email', 'location',
+                        'categories', 'facilities', 'props', 'updatedAt']);
 
-      allow delete: if isAdmin();
+      allow delete: if false;
 
       // Portfolio & gallery docs are created by the server media confirm
-      // step; owners may edit captions/order/category but never the image.
+      // step; owners may edit presentation fields but never the image.
       match /portfolio/{photoId} {
         allow read: if canReadStudioContent(studioId);
         allow create: if false;
-        allow update: if canManageStudio(studioId)
-          && unchanged(['studioId', 'image', 'createdAt']);
-        allow delete: if canManageStudio(studioId);
+        allow update: if ownsStudio(studioId)
+          && onlyChanges(['caption', 'category', 'sortOrder', 'isFeatured', 'updatedAt']);
+        allow delete: if ownsStudio(studioId);
       }
 
       match /gallery/{imageId} {
         allow read: if canReadStudioContent(studioId);
         allow create: if false;
-        allow update: if canManageStudio(studioId)
-          && unchanged(['studioId', 'image', 'createdAt']);
-        allow delete: if canManageStudio(studioId);
+        allow update: if ownsStudio(studioId)
+          && onlyChanges(['caption', 'sortOrder', 'updatedAt']);
+        allow delete: if ownsStudio(studioId);
       }
 
       // Owners manage package details and prices (bookings snapshot the price
       // server-side); package images are attached by the server confirm step.
       match /packages/{packageId} {
         allow read: if canReadStudioContent(studioId);
-        allow create: if canManageStudio(studioId)
-          && request.resource.data.studioId == studioId
-          && request.resource.data.images == [];
-        allow update: if canManageStudio(studioId)
-          && unchanged(['studioId', 'images', 'createdAt']);
-        allow delete: if canManageStudio(studioId);
+        allow create: if ownsStudio(studioId)
+          && incoming().keys().hasOnly(['studioId', 'name', 'description', 'category', 'price',
+                                        'currency', 'durationMinutes', 'editedPhotos',
+                                        'includes', 'images', 'isActive', 'sortOrder',
+                                        'createdAt', 'updatedAt'])
+          && incoming().studioId == studioId
+          && incoming().images == []
+          && incoming().currency == 'NPR'
+          && isNonNegativeInt(incoming().price);
+        allow update: if ownsStudio(studioId)
+          && onlyChanges(['name', 'description', 'category', 'price', 'durationMinutes',
+                          'editedPhotos', 'includes', 'isActive', 'sortOrder', 'updatedAt'])
+          && isNonNegativeInt(incoming().price);
+        allow delete: if ownsStudio(studioId);
       }
 
+      // One doc per day, id = "YYYY-MM-DD". Booking code must re-validate
+      // slots server-side; owner-edited slot statuses are never trusted.
       match /availability/{date} {
         allow read: if canReadStudioContent(studioId);
-        allow create: if canManageStudio(studioId)
-          && request.resource.data.studioId == studioId;
-        allow update: if canManageStudio(studioId)
-          && unchanged(['studioId', 'createdAt']);
-        allow delete: if canManageStudio(studioId);
+        allow create: if ownsStudio(studioId)
+          && incoming().keys().hasOnly(['studioId', 'date', 'isClosed', 'slots',
+                                        'createdAt', 'updatedAt'])
+          && incoming().studioId == studioId
+          && incoming().date == date;
+        allow update: if ownsStudio(studioId)
+          && onlyChanges(['isClosed', 'slots', 'updatedAt']);
+        allow delete: if ownsStudio(studioId);
       }
     }
 
     // Slug reservations are created server-side together with the studio.
+    // Single lookups are public (slug availability / routing); listing is not,
+    // so draft studios cannot be enumerated.
     match /studioSlugs/{slug} {
-      allow read: if true;
+      allow get: if true;
+      allow list: if false;
       allow write: if false;
     }
 

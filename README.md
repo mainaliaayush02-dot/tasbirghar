@@ -41,13 +41,16 @@ With the Cloudinary variables set, run `npm run dev` and open <http://localhost:
 | `npm run build` | Production build and type check |
 | `npm run start` | Serve the production build |
 | `npm run lint` | ESLint |
+| `npm run test:rules` | Firestore security rules tests (needs the Firestore emulator on 127.0.0.1:8080) |
 
 ## Firestore rules
 
-The draft rules are in `firestore.rules`, and the project is set to `tasbirghar-f285b` in `.firebaserc`. After reviewing and testing them in the emulator, deploy with:
+The rules are in `firestore.rules` and the tests in `tests/firestore-rules.test.mjs`. The Firebase CLI needs Java 21 or newer to run the emulator.
 
 ```bash
-npx firebase-tools deploy --only firestore:rules
+npx firebase-tools emulators:start --only firestore --project tasbirghar-f285b   # terminal 1
+npm run test:rules                                                                 # terminal 2
+npx firebase-tools deploy --only firestore:rules --project tasbirghar-f285b       # only after tests pass
 ```
 
 ## Project layout
