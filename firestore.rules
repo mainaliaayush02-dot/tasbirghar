@@ -1,0 +1,104 @@
+rules_version = '2';
+
+// TasbirGhar Firestore rules — Phase 1 DRAFT. Deny by default.
+// Deploy: firebase deploy --only firestore:rules
+// See docs/ARCHITECTURE.md → "Security".
+//
+// Roles come from the Auth custom claim `role` (set only by server code via
+// the Admin SDK), NOT from users/{uid}.role, which a client could edit.
+//
+// Money-bearing documents (bookings) and verified reviews are written only by
+// trusted server code (Admin SDK bypasses these rules), so clients cannot
+// tamper with prices, commission or review eligibility.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isSelf(uid) { return signedIn() && request.auth.uid == uid; }
+    function isAdmin() { return signedIn() && request.auth.token.role == 'admin'; }
+    function isPhotographer() { return signedIn() && request.auth.token.role == 'photographer'; }
+
+    function unchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    function studio(studioId) {
+      return get(/databases/$(database)/documents/studios/$(studioId)).data;
+    }
+    function ownsStudio(studioId) { return signedIn() && studio(studioId).ownerId == request.auth.uid; }
+    function studioIsPublic(studioId) { return studio(studioId).listingStatus == 'published'; }
+
+    // ---------------------------------------------------------------- users
+    match /users/{uid} {
+      allow read: if isSelf(uid) || isAdmin();
+      // Self sign-up may only claim customer/photographer, never admin.
+      allow create: if isSelf(uid)
+        && request.resource.data.role in ['customer', 'photographer'];
+      allow update: if (isSelf(uid) && unchanged(['role', 'studioId', 'createdAt'])) || isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // -------------------------------------------------------------- studios
+    match /studios/{studioId} {
+      allow read: if resource.data.listingStatus == 'published'
+        || (signedIn() && resource.data.ownerId == request.auth.uid)
+        || isAdmin();
+
+      // Studios start as drafts, owned by the creator, unverified.
+      allow create: if isPhotographer()
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.listingStatus == 'draft'
+        && request.resource.data.verificationStatus == 'unverified';
+
+      // Owners edit their profile; moderation, ownership, stats and
+      // commission fields are admin/server controlled.
+      allow update: if (signedIn() && resource.data.ownerId == request.auth.uid
+          && unchanged(['ownerId', 'slug', 'verificationStatus', 'listingStatus',
+                        'stats', 'commissionRateBps', 'startingPrice', 'createdAt']))
+        || isAdmin();
+
+      allow delete: if isAdmin();
+
+      match /{sub}/{docId} {
+        allow read: if sub in ['portfolio', 'gallery', 'packages', 'availability']
+          && (studioIsPublic(studioId) || ownsStudio(studioId) || isAdmin());
+        allow create, update: if sub in ['portfolio', 'gallery', 'packages', 'availability']
+          && (ownsStudio(studioId) || isAdmin())
+          && request.resource.data.studioId == studioId;
+        allow delete: if sub in ['portfolio', 'gallery', 'packages', 'availability']
+          && (ownsStudio(studioId) || isAdmin());
+      }
+    }
+
+    // Slug reservations are created server-side together with the studio.
+    match /studioSlugs/{slug} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // ------------------------------------------------------------- bookings
+    // Created/updated only by server code (price + commission computed there).
+    match /bookings/{bookingId} {
+      allow read: if signedIn() && (
+        resource.data.customerId == request.auth.uid
+        || resource.data.studioOwnerId == request.auth.uid
+        || isAdmin());
+      allow write: if false;
+    }
+
+    // -------------------------------------------------------------- reviews
+    // Created server-side only after a completed booking (doc id = bookingId).
+    match /reviews/{reviewId} {
+      allow read: if resource.data.status == 'published'
+        || (signedIn() && resource.data.customerId == request.auth.uid)
+        || isAdmin();
+      allow write: if false;
+    }
+
+    // Everything else is closed.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

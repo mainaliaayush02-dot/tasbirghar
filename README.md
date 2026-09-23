@@ -1,36 +1,63 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# TasbirGhar (तस्वीरघर)
 
-## Getting Started
+A photography marketplace for Nepal: discover, compare and book newborn, maternity, baby, cake smash, family, couple and studio photographers across Kathmandu Valley.
 
-First, run the development server:
+**Stack:** Next.js 16 (App Router) · TypeScript · Tailwind CSS 4 · Firebase Auth + Firestore · Cloudinary · Vercel
+
+Architecture, data model, money and commission model, and security notes are in **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+
+## Local setup
+
+Requirements: Node.js 20.9 or later (22 LTS recommended) and npm.
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+git clone git@github.com:mainaliaayush02-dot/tasbirghar.git
+cd tasbirghar
+npm install
+cp .env.example .env.local   # then fill in the values (see below)
+npm run dev                  # http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+### Environment variables
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+| Variable | Where to find it |
+| --- | --- |
+| `NEXT_PUBLIC_FIREBASE_*` | Firebase console → Project settings → Your apps → Web app config |
+| `NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME` | Cloudinary console → Dashboard |
+| `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET` | Cloudinary console → Settings → API Keys (**server only, never `NEXT_PUBLIC_`**) |
+| `NEXT_PUBLIC_APP_URL` | `http://localhost:3000` locally, or the production domain on Vercel |
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Never commit `.env.local`. In production, set the same variables in Vercel → Project → Settings → Environment Variables.
 
-## Learn More
+### Test the Cloudinary upload (development only)
 
-To learn more about Next.js, take a look at the following resources:
+With the Cloudinary variables set, run `npm run dev` and open <http://localhost:3000/dev/cloudinary-test>. Pick an image, upload it, and check the returned `publicId`, `url`, `width`, `height`, `format` and `bytes`, along with the optimized preset URLs. You can then delete the test asset. The page and its API route return 404 in production builds.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Scripts
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+| Command | Purpose |
+| --- | --- |
+| `npm run dev` | Development server (Turbopack) |
+| `npm run build` | Production build and type check |
+| `npm run start` | Serve the production build |
+| `npm run lint` | ESLint |
 
-## Deploy on Vercel
+## Firestore rules
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+The draft rules are in `firestore.rules`, and the project is set to `tasbirghar-f285b` in `.firebaserc`. After reviewing and testing them in the emulator, deploy with:
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```bash
+npx firebase-tools deploy --only firestore:rules
+```
+
+## Project layout
+
+```
+src/app/            routes: (public), (customer)/account, (studio)/dashboard, (admin)/admin, api/
+src/lib/firebase/   Firebase app, auth, firestore, optional analytics
+src/lib/cloudinary/ server-only upload/delete + shared validation, folders, delivery URLs
+src/lib/money.ts    integer (paisa) money and commission math
+src/types/          Firestore data model and media types
+src/config/         site, categories, locations, routes
+docs/               architecture documentation
+```
