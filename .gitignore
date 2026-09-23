@@ -42,6 +42,13 @@ pubsub-debug.log*
 .env*
 !.env.example
 
+# Firebase Admin / Google service-account credentials — never commit.
+# Use FIREBASE_ADMIN_* in .env.local (see .env.example) instead.
+*-firebase-adminsdk-*.json
+*service-account*.json
+*serviceAccount*.json
+*credentials*.json
+
 # vercel
 .vercel
 
