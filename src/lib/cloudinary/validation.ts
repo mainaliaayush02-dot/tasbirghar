@@ -5,8 +5,8 @@ import {
 } from "./types";
 
 /**
- * Identify an image by its magic bytes. The browser-supplied MIME type and
- * file extension are attacker-controlled, so they are ignored entirely.
+ * Identify an image by its magic bytes rather than its extension or the
+ * browser-reported MIME type.
  */
 export function sniffImageType(bytes: Uint8Array): AllowedImageMimeType | null {
   const ascii = (start: number, end: number) =>
@@ -43,23 +43,13 @@ export function sniffImageType(bytes: Uint8Array): AllowedImageMimeType | null {
   return null;
 }
 
-export interface ValidatedImage {
-  buffer: Buffer;
-  mimeType: AllowedImageMimeType;
-  bytes: number;
-  originalName: string;
-}
-
 /**
- * Validate an uploaded File (from `request.formData()`): present, non-empty,
- * within the size limit, and actually one of the allowed image formats.
+ * Browser-side pre-flight check before a direct upload, so users get instant,
+ * friendly errors without wasting bandwidth. This is UX only — the
+ * authoritative checks are Cloudinary's signed `allowed_formats` and the
+ * server-side `confirmUploadedImage`.
  */
-export async function validateImageFile(
-  file: FormDataEntryValue | null,
-): Promise<ValidatedImage> {
-  if (!file || typeof file === "string") {
-    throw new MediaError("NO_FILE", "No image file was provided.");
-  }
+export async function preflightImageFile(file: File): Promise<AllowedImageMimeType> {
   if (file.size === 0) {
     throw new MediaError("EMPTY_FILE", "The selected file is empty.");
   }
@@ -70,9 +60,8 @@ export async function validateImageFile(
       413,
     );
   }
-
-  const buffer = Buffer.from(await file.arrayBuffer());
-  const mimeType = sniffImageType(buffer);
+  const head = new Uint8Array(await file.slice(0, 64).arrayBuffer());
+  const mimeType = sniffImageType(head);
   if (!mimeType) {
     throw new MediaError(
       "UNSUPPORTED_TYPE",
@@ -80,6 +69,5 @@ export async function validateImageFile(
       415,
     );
   }
-
-  return { buffer, mimeType, bytes: buffer.byteLength, originalName: file.name };
+  return mimeType;
 }

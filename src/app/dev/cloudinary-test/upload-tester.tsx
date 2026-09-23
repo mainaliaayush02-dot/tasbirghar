@@ -4,7 +4,24 @@ import { useState } from "react";
 
 import { CloudinaryImage } from "@/components/media/cloudinary-image";
 import { cloudinaryUrl, IMAGE_PRESETS, type ImagePreset } from "@/lib/cloudinary/delivery";
+import { preflightImageFile } from "@/lib/cloudinary/validation";
 import type { MediaAsset } from "@/types/media";
+
+interface SignedUpload {
+  uploadUrl: string;
+  fields: Record<string, string>;
+}
+
+async function postJson<T>(url: string, payload?: unknown): Promise<T> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: payload === undefined ? undefined : JSON.stringify(payload),
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(body?.error?.message ?? `HTTP ${res.status}`);
+  return body as T;
+}
 
 type State =
   | { status: "idle" }
@@ -18,13 +35,32 @@ export function UploadTester() {
 
   async function upload(formData: FormData) {
     setState({ status: "uploading" });
-    const res = await fetch("/api/dev/cloudinary-test", { method: "POST", body: formData });
-    const body = await res.json().catch(() => null);
-    if (!res.ok) {
-      setState({ status: "error", message: body?.error?.message ?? `HTTP ${res.status}` });
-      return;
+    try {
+      const file = formData.get("file");
+      if (!(file instanceof File) || file.size === 0) throw new Error("Choose an image first.");
+      // 0. Instant client-side check (UX only; the server re-verifies).
+      const detectedType = await preflightImageFile(file);
+
+      // 1. Server signs the upload params (secret never leaves the server).
+      const signed = await postJson<SignedUpload>("/api/dev/cloudinary-test/sign");
+
+      // 2. Browser uploads directly to Cloudinary — no Next.js route in the file path.
+      const body = new FormData();
+      Object.entries(signed.fields).forEach(([key, value]) => body.append(key, value));
+      body.append("file", file);
+      const res = await fetch(signed.uploadUrl, { method: "POST", body });
+      const uploaded = await res.json();
+      if (!res.ok) throw new Error(uploaded?.error?.message ?? `Cloudinary HTTP ${res.status}`);
+
+      // 3. Server confirms against Cloudinary's own record and returns metadata to persist.
+      const { asset } = await postJson<{ asset: MediaAsset }>("/api/dev/cloudinary-test/confirm", {
+        publicId: uploaded.public_id,
+        alt: formData.get("alt"),
+      });
+      setState({ status: "done", asset, detectedType });
+    } catch (error) {
+      setState({ status: "error", message: error instanceof Error ? error.message : String(error) });
     }
-    setState({ status: "done", asset: body.asset, detectedType: body.detectedType });
   }
 
   async function remove(publicId: string) {
@@ -77,7 +113,7 @@ export function UploadTester() {
       {state.status === "done" && (
         <section className="space-y-4">
           <h2 className="font-medium">
-            Media metadata to persist in Firestore (sniffed type: {state.detectedType})
+            Media metadata to persist in Firestore (browser-sniffed type: {state.detectedType})
           </h2>
           <pre className="overflow-x-auto rounded bg-neutral-100 p-3 text-xs">
             {JSON.stringify(state.asset, null, 2)}

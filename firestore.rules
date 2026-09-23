@@ -5,11 +5,19 @@ rules_version = '2';
 // See docs/ARCHITECTURE.md → "Security".
 //
 // Roles come from the Auth custom claim `role` (set only by server code via
-// the Admin SDK), NOT from users/{uid}.role, which a client could edit.
+// the Admin SDK). users/{uid}.role is a read-only mirror for the UI: clients
+// may only ever write "customer" there, and can never change it afterwards.
+// Becoming a photographer (or admin) happens server-side, which sets the
+// claim and updates the mirror together.
 //
 // Money-bearing documents (bookings) and verified reviews are written only by
 // trusted server code (Admin SDK bypasses these rules), so clients cannot
 // tamper with prices, commission or review eligibility.
+//
+// Media fields (MediaAsset: users.photo, studio profileImage/coverImage,
+// portfolio/gallery `image`, package `images`) are written only by the server
+// media "confirm" step, which verifies the asset with Cloudinary. Clients can
+// never point a document at an arbitrary (e.g. another studio's) publicId.
 
 service cloud.firestore {
   match /databases/{database}/documents {
@@ -17,7 +25,6 @@ service cloud.firestore {
     function signedIn() { return request.auth != null; }
     function isSelf(uid) { return signedIn() && request.auth.uid == uid; }
     function isAdmin() { return signedIn() && request.auth.token.role == 'admin'; }
-    function isPhotographer() { return signedIn() && request.auth.token.role == 'photographer'; }
 
     function unchanged(fields) {
       return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
@@ -28,14 +35,21 @@ service cloud.firestore {
     }
     function ownsStudio(studioId) { return signedIn() && studio(studioId).ownerId == request.auth.uid; }
     function studioIsPublic(studioId) { return studio(studioId).listingStatus == 'published'; }
+    function canManageStudio(studioId) { return ownsStudio(studioId) || isAdmin(); }
+    function canReadStudioContent(studioId) {
+      return studioIsPublic(studioId) || ownsStudio(studioId) || isAdmin();
+    }
 
     // ---------------------------------------------------------------- users
     match /users/{uid} {
       allow read: if isSelf(uid) || isAdmin();
-      // Self sign-up may only claim customer/photographer, never admin.
+      // Self sign-up always starts as a customer, with no studio or photo.
       allow create: if isSelf(uid)
-        && request.resource.data.role in ['customer', 'photographer'];
-      allow update: if (isSelf(uid) && unchanged(['role', 'studioId', 'createdAt'])) || isAdmin();
+        && request.resource.data.role == 'customer'
+        && request.resource.data.studioId == null
+        && request.resource.data.photo == null;
+      allow update: if (isSelf(uid) && unchanged(['role', 'studioId', 'photo', 'createdAt']))
+        || isAdmin();
       allow delete: if isAdmin();
     }
 
@@ -45,29 +59,59 @@ service cloud.firestore {
         || (signedIn() && resource.data.ownerId == request.auth.uid)
         || isAdmin();
 
-      // Studios start as drafts, owned by the creator, unverified.
-      allow create: if isPhotographer()
-        && request.resource.data.ownerId == request.auth.uid
-        && request.resource.data.listingStatus == 'draft'
-        && request.resource.data.verificationStatus == 'unverified';
+      // Created only by server code (onboarding API), which atomically reserves
+      // studioSlugs/{slug} and sets server-controlled fields (commissionRateBps,
+      // stats, statuses) — a client create could otherwise set its own
+      // commission rate.
+      allow create: if false;
 
-      // Owners edit their profile; moderation, ownership, stats and
-      // commission fields are admin/server controlled.
+      // Owners edit their profile text; moderation, ownership, stats,
+      // commission and media fields are admin/server controlled.
       allow update: if (signedIn() && resource.data.ownerId == request.auth.uid
           && unchanged(['ownerId', 'slug', 'verificationStatus', 'listingStatus',
-                        'stats', 'commissionRateBps', 'startingPrice', 'createdAt']))
+                        'stats', 'commissionRateBps', 'startingPrice',
+                        'profileImage', 'coverImage', 'createdAt']))
         || isAdmin();
 
       allow delete: if isAdmin();
 
-      match /{sub}/{docId} {
-        allow read: if sub in ['portfolio', 'gallery', 'packages', 'availability']
-          && (studioIsPublic(studioId) || ownsStudio(studioId) || isAdmin());
-        allow create, update: if sub in ['portfolio', 'gallery', 'packages', 'availability']
-          && (ownsStudio(studioId) || isAdmin())
+      // Portfolio & gallery docs are created by the server media confirm
+      // step; owners may edit captions/order/category but never the image.
+      match /portfolio/{photoId} {
+        allow read: if canReadStudioContent(studioId);
+        allow create: if false;
+        allow update: if canManageStudio(studioId)
+          && unchanged(['studioId', 'image', 'createdAt']);
+        allow delete: if canManageStudio(studioId);
+      }
+
+      match /gallery/{imageId} {
+        allow read: if canReadStudioContent(studioId);
+        allow create: if false;
+        allow update: if canManageStudio(studioId)
+          && unchanged(['studioId', 'image', 'createdAt']);
+        allow delete: if canManageStudio(studioId);
+      }
+
+      // Owners manage package details and prices (bookings snapshot the price
+      // server-side); package images are attached by the server confirm step.
+      match /packages/{packageId} {
+        allow read: if canReadStudioContent(studioId);
+        allow create: if canManageStudio(studioId)
+          && request.resource.data.studioId == studioId
+          && request.resource.data.images == [];
+        allow update: if canManageStudio(studioId)
+          && unchanged(['studioId', 'images', 'createdAt']);
+        allow delete: if canManageStudio(studioId);
+      }
+
+      match /availability/{date} {
+        allow read: if canReadStudioContent(studioId);
+        allow create: if canManageStudio(studioId)
           && request.resource.data.studioId == studioId;
-        allow delete: if sub in ['portfolio', 'gallery', 'packages', 'availability']
-          && (ownsStudio(studioId) || isAdmin());
+        allow update: if canManageStudio(studioId)
+          && unchanged(['studioId', 'createdAt']);
+        allow delete: if canManageStudio(studioId);
       }
     }
 

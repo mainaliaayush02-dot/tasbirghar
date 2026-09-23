@@ -37,7 +37,8 @@ src/
     env/               public.ts (NEXT_PUBLIC_*), server.ts (secrets, server-only)
     firebase/          client.ts (app), auth.ts, firestore.ts, analytics.ts (optional, browser-only)
     firestore/         collection path constants
-    cloudinary/        config, upload, delete (server-only), validation, folders, delivery (client-safe)
+    auth/              roles.ts (role claim model, area access)
+    cloudinary/        config, signature, confirm, delete (server-only); validation, folders, delivery (shared)
     money.ts           integer money and commission math
     seo.ts             per-page metadata / canonical helper
   types/               models.ts (Firestore schema), media.ts
@@ -56,7 +57,7 @@ Route groups (the `(name)` folders) don't show up in URLs. Each area gets its ow
 
 The Firebase App is initialized lazily and as a singleton (`getApps()` check), so imports never throw at build time and hot reload doesn't create duplicate apps.
 
-**Roles.** Roles are stored as a Firebase Auth **custom claim** `role` (`customer | photographer | admin`), and only server code using the Admin SDK can set it. `users/{uid}.role` mirrors the claim for the UI, but security rules and server code never trust that field.
+**Roles.** Roles are stored as a Firebase Auth **custom claim** `role` (`customer | photographer | admin`), and only server code using the Admin SDK can set it. Having no claim means `customer`. `src/lib/auth/roles.ts` defines the role list, `roleFromClaims()` and which roles may enter each area (`AREA_ROLES`). `users/{uid}.role` is a read-only mirror for the UI: the rules allow clients to create it only as `"customer"` and never to change it. Becoming a photographer happens through a server onboarding endpoint, which sets the claim and the mirror together.
 
 ---
 
@@ -67,9 +68,10 @@ Cloudinary stores every marketplace image: studio profile photos, portfolio, stu
 | Module | Runs on | Purpose |
 | --- | --- | --- |
 | `cloudinary/config.ts` | server only | Configures the SDK from env (the secret lives only here) |
-| `cloudinary/upload.ts` | server only | `uploadImage(validatedImage, { folder })` returns a `MediaAsset` |
+| `cloudinary/signature.ts` | server only | `signImageUpload({ folder })` returns signed params for a browser → Cloudinary direct upload |
+| `cloudinary/confirm.ts` | server only | `confirmUploadedImage(publicId, { expectedFolder })` checks the stored asset and returns a `MediaAsset` |
 | `cloudinary/delete.ts` | server only | `deleteImage(publicId)` (restricted to `tasbirghar/`) and `deleteImageQuietly` for replace flows |
-| `cloudinary/validation.ts` | server | Size limit and magic-byte type sniffing |
+| `cloudinary/validation.ts` | shared | Magic-byte sniffing and the browser pre-flight check (UX only) |
 | `cloudinary/folders.ts` | shared | Folder builders and ID sanitization |
 | `cloudinary/delivery.ts` | shared | Optimized delivery URLs and the `next/image` loader |
 | `components/media/cloudinary-image.tsx` | client | Responsive `<CloudinaryImage asset preset sizes />` |
@@ -91,17 +93,19 @@ tasbirghar/
   dev-tests/     development upload test only
 ```
 
-Every upload gets a random UUID public ID inside its folder (`tasbirghar/studios/abc/portfolio/3f2c…`). The folder is always built with `studioMediaFolder()`, which rejects IDs that look like paths, and never from raw user input.
+The Cloudinary environment (`db3gc28tp`) uses **Dynamic Folders**. Placement is set with the `asset_folder` upload parameter. The legacy `folder` parameter is never used. The server also chooses the `public_id`, a random UUID prefixed with the same path (`tasbirghar/studios/abc/portfolio/3f2c…`). In Dynamic Folders mode, the public ID and the folder are independent. The prefix lets server code check which area an ID belongs to (for example, delete is refused for anything outside `tasbirghar/`) without an API call. The folder is always built with `studioMediaFolder()` / `userAvatarFolder()`, which reject IDs that look like paths, and never from raw user input.
 
 ### What gets stored in Firestore
 
 ```ts
 interface MediaAsset {
   publicId: string;   // required: used to delete, replace or re-transform
-  url: string;        // original secure_url, for reference
+  secureUrl: string;  // original secure_url, for reference only (render via cloudinaryUrl)
   width?: number; height?: number; format?: string; bytes?: number; alt?: string;
 }
 ```
+
+Image binaries are never stored in Firestore, only this metadata.
 
 **Replacing an image:** upload the new one, save the new `MediaAsset` to Firestore, then call `deleteImageQuietly(oldPublicId)`. A failed upload therefore never leaves a record pointing at a missing image. At worst an old asset is left orphaned, and a later cleanup job can remove it.
 
@@ -116,26 +120,36 @@ Originals stay in Cloudinary untouched. Every rendered URL is a transformed deri
 | `gallery` | ≤1600w `c_limit` | portfolio grid, studio gallery |
 | `full` | ≤2400w `c_limit` | lightbox |
 
+Verified against the live account: with `f_auto`, browsers that accept WebP get WebP and others get JPEG. Cloudinary did not serve AVIF even when the request advertised AVIF support. It chooses whether to deliver AVIF based on account plan and settings, and no code change is needed if AVIF is enabled later.
+
 `<CloudinaryImage>` passes a Cloudinary loader to `next/image`. Next.js produces the `srcset` and Cloudinary does the resizing, so each device downloads only the width it needs, capped at the preset's maximum. Next's own image optimizer is bypassed, which avoids double processing and Vercel image-optimization costs. Build Cloudinary URLs only through `cloudinaryUrl()` and never by hand.
 
-### Upload validation
+### Upload flow: signed direct upload
 
-- Allowed types: JPEG, PNG, WEBP, AVIF. The type is detected from **magic bytes**. The file extension and browser MIME type are ignored because the client controls them.
-- Maximum size: **10 MB** per image, which is also Cloudinary's free-plan per-image limit.
-- Cloudinary re-checks the decoded format (`allowed_formats`) as a second layer of defense.
-- Video, SVG (which can carry scripts), GIF and any other type is rejected with a clean `UNSUPPORTED_TYPE` (415) error.
+File bytes never pass through a Next.js route. This avoids Vercel's 4.5 MB request-body limit and keeps function time low.
 
-### ⚠️ Upload size on Vercel
+```
+Browser                         Next.js server                         Cloudinary
+  │ pre-flight check (UX only)
+  │ 1. POST …/sign ────────────▶ authorize user → studio folder
+  │                              sign {timestamp, public_id, asset_folder,
+  │ ◀──────────── signed fields   allowed_formats, overwrite=false, tags}
+  │ 2. POST file + fields ──────────────────────────────────────────────▶ verifies signature,
+  │ ◀─────────────────────────────────────────────────── public_id, …    decodes & checks format
+  │ 3. POST …/confirm {publicId} ▶ Admin API: read asset back, check
+  │                              format, bytes ≤ 10 MB, asset_folder
+  │                              (invalid → delete) → persist MediaAsset
+  │ ◀──────────── MediaAsset
+```
 
-Vercel Functions reject request bodies larger than **4.5 MB**. Proxying uploads through a route handler, as the dev test does, therefore works locally for files up to 10 MB but fails on Vercel for files over 4.5 MB. Photographers' originals are often larger than that.
+- **The secret stays on the server.** The browser receives only `api_key` and a SHA signature. The API key alone can't sign requests.
+- **The signature is bound to its parameters.** Changing `asset_folder` or `public_id` gets `401 Invalid Signature` from Cloudinary; both were tested live. Signatures expire after one hour.
+- **Types:** JPEG, PNG, WEBP, AVIF. Cloudinary enforces the signed `allowed_formats` against the decoded file, so a renamed PHP file is rejected with `400` (tested). SVG, GIF, video and everything else is refused.
+- **Size:** 10 MB per image, which is also Cloudinary's free-plan limit. It's enforced in the confirm step from Cloudinary's own `bytes`, and oversized assets are deleted.
+- **The browser pre-flight** (`preflightImageFile`: magic bytes and size) only gives instant feedback. It is not a security boundary.
+- **Unconfirmed uploads**, where the browser uploads and never calls confirm, are possible. They're harmless orphans that nothing references. A periodic cleanup job can remove assets under `tasbirghar/` that have no Firestore reference.
 
-**Planned production flow (Phase 2): signed direct upload.**
-
-1. The dashboard asks `POST /api/media/sign` for signed parameters. The server verifies the Firebase ID token and studio ownership, then signs `{ folder, public_id, allowed_formats, timestamp }` with the API secret.
-2. The browser uploads directly to Cloudinary using those parameters. The secret is never sent to the browser, and a signature only covers the folder it was issued for.
-3. The browser posts the resulting `public_id` to `POST /api/media/confirm`. The server fetches the asset's metadata from the Cloudinary Admin API, enforces the size and format limits (and deletes the asset if they're violated), then writes the `MediaAsset` to Firestore.
-
-The validation, folder and delete modules are reused unchanged. Only the transport changes.
+In the dev test (`/dev/cloudinary-test`), the `sign`, `confirm` and `DELETE` endpoints live under `/api/dev/cloudinary-test`. Phase 2 production endpoints (`/api/media/sign`, `/api/media/confirm`, `DELETE /api/media`) reuse the same library functions and add Firebase ID-token verification and studio ownership checks.
 
 ---
 
@@ -246,10 +260,15 @@ Phase 2 will add Firebase Admin credentials (`FIREBASE_ADMIN_*`, server only). L
 
 1. **Secrets never reach the browser.** Only `NEXT_PUBLIC_*` values are inlined into client bundles. Cloudinary credentials are read only in `lib/env/server.ts` and `lib/cloudinary/config.ts`, both of which import `server-only`. The build output was scanned to confirm no Cloudinary secret or key strings appear in `.next/static`.
 2. **Firebase web config is public by design.** Protection comes from Firestore rules, and later from App Check and restrictions on the API key.
-3. **Deny by default.** `firestore.rules` closes every path except those explicitly opened. Clients can never write bookings or reviews. Those writes go through server code using the Admin SDK, so prices, commission and review eligibility can't be tampered with. Owners can't change moderation fields (`listingStatus`, `verificationStatus`), `stats`, `commissionRateBps` or `ownerId`. Roles come from custom claims.
-4. **No anonymous uploads.** The only upload endpoint today, `/api/dev/cloudinary-test`, returns 404 unless `NODE_ENV === "development"`, and writes only to `tasbirghar/dev-tests/`. Production upload endpoints must verify the Firebase ID token and studio ownership before signing or accepting an upload.
+3. **Deny by default.** `firestore.rules` closes every path except those explicitly opened. Clients can never write bookings or reviews. Those writes go through server code using the Admin SDK, so prices, commission and review eligibility can't be tampered with. Studios are **created only server-side**, because a client create could set its own `commissionRateBps` and the slug must be reserved atomically. Owners can't change moderation fields (`listingStatus`, `verificationStatus`), `stats`, `commissionRateBps`, `startingPrice` or `ownerId`. Roles come from custom claims, and clients can only ever write `role: "customer"`. **Media fields are server-written only.** These are `users.photo`, studio `profileImage`/`coverImage`, portfolio and gallery `image`, and package `images`. They're set by the media confirm step after the asset has been verified with Cloudinary. Portfolio and gallery docs are created server-side, and owners can edit only captions, order and category. A client therefore can't point a document at another studio's `publicId`.
+4. **No anonymous uploads.** The only signing endpoint today, `/api/dev/cloudinary-test/sign`, returns 404 unless `NODE_ENV === "development"` (verified on a production build), and signs only for `tasbirghar/dev-tests/`. Production signing endpoints must verify the Firebase ID token and studio ownership before signing.
 5. **Destructive media operations** are restricted to public IDs under `tasbirghar/` and are always authorized by the caller.
-6. **Uploads are validated server-side** by magic bytes and size, with Cloudinary's `allowed_formats` as a second check.
+6. **Uploads are validated without trusting the browser.** Cloudinary enforces the signed `allowed_formats` on the decoded file, and the confirm step re-checks format, size and `asset_folder` from the Cloudinary Admin API.
 7. **Private areas** are `noindex` and disallowed in robots. Auth gating comes in Phase 2.
 
-The rules in `firestore.rules` are a **draft** and have not been deployed. Deploy them with `firebase deploy --only firestore:rules` after testing them in the Firebase emulator.
+The rules in `firestore.rules` have been reviewed by hand but **not yet validated or deployed**. The Firestore database (production mode, `asia-south1`) currently runs Firebase's default deny-all rules. Before deploying:
+
+1. Install **Java 21 or newer** (firebase-tools 15 requires it for the emulator), for example Eclipse Temurin 21 from adoptium.net.
+2. Log the Firebase CLI in with an account that has access to `tasbirghar-f285b` (`npx firebase-tools login:add`, then `login:use`).
+3. Run `npx firebase-tools emulators:start --only firestore --project tasbirghar-f285b`, which compiles the rules, and test the allow and deny cases for each collection.
+4. Deploy with `npx firebase-tools deploy --only firestore:rules --project tasbirghar-f285b`.

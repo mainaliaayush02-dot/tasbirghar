@@ -31,7 +31,7 @@ Never commit `.env.local`. In production, set the same variables in Vercel → P
 
 ### Test the Cloudinary upload (development only)
 
-With the Cloudinary variables set, run `npm run dev` and open <http://localhost:3000/dev/cloudinary-test>. Pick an image, upload it, and check the returned `publicId`, `url`, `width`, `height`, `format` and `bytes`, along with the optimized preset URLs. You can then delete the test asset. The page and its API route return 404 in production builds.
+With the Cloudinary variables set, run `npm run dev` and open <http://localhost:3000/dev/cloudinary-test>. Pick an image and upload it. The server signs the upload, the browser sends the file directly to Cloudinary (`asset_folder: tasbirghar/dev-tests`), and the server confirms it. Check the returned `publicId`, `secureUrl`, `width`, `height`, `format` and `bytes`, along with the optimized preset URLs, then delete the test asset. The page and its API routes return 404 in production builds.
 
 ## Scripts
 
@@ -55,7 +55,8 @@ npx firebase-tools deploy --only firestore:rules
 ```
 src/app/            routes: (public), (customer)/account, (studio)/dashboard, (admin)/admin, api/
 src/lib/firebase/   Firebase app, auth, firestore, optional analytics
-src/lib/cloudinary/ server-only upload/delete + shared validation, folders, delivery URLs
+src/lib/cloudinary/ server-only sign/confirm/delete + shared validation, folders, delivery URLs
+src/lib/auth/       role (custom claim) model
 src/lib/money.ts    integer (paisa) money and commission math
 src/types/          Firestore data model and media types
 src/config/         site, categories, locations, routes

@@ -13,9 +13,9 @@ export type AllowedImageMimeType = (typeof ALLOWED_IMAGE_MIME_TYPES)[number];
 export const ALLOWED_IMAGE_FORMATS = ["jpg", "png", "webp", "avif"] as const;
 
 /**
- * 10 MB — also the Cloudinary free-plan per-image limit.
- * NOTE: Vercel Functions cap request bodies at 4.5 MB, so server-proxied
- * uploads of larger files will fail there; see docs/ARCHITECTURE.md.
+ * 10 MB — also the Cloudinary free-plan per-image limit. Files are uploaded
+ * browser → Cloudinary directly (signed), never through a Next.js route, so
+ * Vercel's 4.5 MB request-body limit does not apply.
  */
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 
@@ -26,7 +26,6 @@ export type MediaErrorCode =
   | "UNSUPPORTED_TYPE"
   | "INVALID_TARGET"
   | "NOT_CONFIGURED"
-  | "UPLOAD_FAILED"
   | "DELETE_FAILED";
 
 export class MediaError extends Error {

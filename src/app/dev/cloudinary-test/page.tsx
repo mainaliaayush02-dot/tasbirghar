@@ -15,8 +15,9 @@ export default function CloudinaryTestPage() {
     <main className="mx-auto w-full max-w-2xl px-4 py-10">
       <h1 className="text-2xl font-semibold">Cloudinary upload test</h1>
       <p className="mt-2 text-sm text-neutral-600">
-        Development only. Uploads go to <code>tasbirghar/dev-tests/</code> through the
-        server route; the API secret never reaches the browser.
+        Development only. The server signs the upload, the browser sends the file directly
+        to Cloudinary (<code>asset_folder: tasbirghar/dev-tests</code>), and the server
+        confirms it. The API secret never reaches the browser.
       </p>
       <UploadTester />
     </main>

@@ -35,9 +35,10 @@ interface Timestamps {
 export type UserRole = "customer" | "photographer" | "admin";
 
 /**
- * users/{uid}. `role` here is informational/for UI; authorization decisions in
- * security rules and server code use the Firebase Auth custom claim `role`,
- * which only the server (Admin SDK) can set.
+ * users/{uid}. `role` is a read-only mirror of the Firebase Auth custom claim
+ * `role` (see `@/lib/auth/roles`), kept for UI and admin queries. Clients can
+ * only create it as "customer" and never change it; authorization decisions
+ * in rules and server code always use the claim.
  */
 export interface UserDoc extends Timestamps {
   role: UserRole;
