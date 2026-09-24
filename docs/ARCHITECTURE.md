@@ -181,6 +181,18 @@ Design notes:
 
 ---
 
+### Composite indexes
+
+Firestore builds single-field indexes automatically. Composite indexes are declared in `firestore.indexes.json` and deployed with `npx firebase-tools deploy --only firestore:indexes --project tasbirghar-f285b`. The emulator does **not** enforce indexes, so a query that passes locally can still fail in production with `FAILED_PRECONDITION`. Probe new query shapes against the live project, read-only, before release.
+
+| Collection | Fields | Used by |
+| --- | --- | --- |
+| `bookings` | `bookingStatus` ↑, `commissionAmount` ↑, `grossAmount` ↑, `photographerNetAmount` ↑ | `getMarketplaceStats` (`/admin` money KPIs) and `getCommissionOverview` (`/admin/commission`) |
+
+Every booking money aggregation goes through `MONEY_SUMS` in `src/lib/data/admin.ts`, which always sums the same three fields filtered on `bookingStatus` (`==` or `in`). That is why one index serves them all. Summing a different set of fields would require another index.
+
+Every other admin query (a single equality filter, a single-field `orderBy`, `!=`, `in`, or `count()` with one filter) uses the automatic single-field indexes. All 47 query shapes were verified against the live project.
+
 ## 5. Authentication, roles and onboarding (Phase 2)
 
 ### Sessions

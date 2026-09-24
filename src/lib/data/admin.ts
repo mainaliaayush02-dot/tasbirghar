@@ -48,8 +48,25 @@ const LIST_SCAN_LIMIT = 500;
 
 const db = () => adminDb();
 const count = async (query: Query) => (await query.count().get()).data().count;
-const sum = async (query: Query, field: string): Promise<number> =>
-  (await query.aggregate({ total: AggregateField.sum(field) }).get()).data().total ?? 0;
+
+/**
+ * Booking money totals. Every money aggregation sums the SAME three fields
+ * (filtered on bookingStatus), so a single composite index serves the
+ * dashboard and the commission page:
+ *   bookings: bookingStatus ASC, commissionAmount ASC, grossAmount ASC,
+ *             photographerNetAmount ASC  (see firestore.indexes.json)
+ * Summing a different field set would require a different index.
+ */
+const MONEY_SUMS = {
+  gross: AggregateField.sum("grossAmount"),
+  commission: AggregateField.sum("commissionAmount"),
+  net: AggregateField.sum("photographerNetAmount"),
+};
+
+async function sumMoney(query: Query): Promise<{ gross: number; commission: number; net: number }> {
+  const d = (await query.aggregate(MONEY_SUMS).get()).data();
+  return { gross: d.gross ?? 0, commission: d.commission ?? 0, net: d.net ?? 0 };
+}
 
 /** Bookings that count toward booking value (confirmed or delivered). */
 const VALUE_STATUSES: BookingStatus[] = ["confirmed", "completed"];
@@ -125,7 +142,7 @@ export async function getMarketplaceStats(): Promise<MarketplaceStats> {
     appPending, appApproved, appRejected,
     photographers, customers, admins,
     bookingTotal, bookingCompleted, bookingPending,
-    bookingValue, commission, photographerNet,
+    valuedMoney, completedMoney,
   ] = await Promise.all([
     count(studios),
     count(studios.where("listingStatus", "==", "draft")),
@@ -142,9 +159,8 @@ export async function getMarketplaceStats(): Promise<MarketplaceStats> {
     count(bookings),
     count(completed),
     count(bookings.where("bookingStatus", "==", "pending")),
-    sum(valued, "grossAmount"),
-    sum(completed, "commissionAmount"),
-    sum(completed, "photographerNetAmount"),
+    sumMoney(valued),
+    sumMoney(completed),
   ]);
 
   return {
@@ -155,7 +171,11 @@ export async function getMarketplaceStats(): Promise<MarketplaceStats> {
     customers,
     admins,
     bookings: { total: bookingTotal, completed: bookingCompleted, pending: bookingPending },
-    money: { bookingValue, commission, photographerNet },
+    money: {
+      bookingValue: valuedMoney.gross,
+      commission: completedMoney.commission,
+      photographerNet: completedMoney.net,
+    },
   };
 }
 
@@ -540,14 +560,7 @@ export async function getCommissionOverview(): Promise<CommissionOverview> {
   const byStatus = await Promise.all(
     statuses.map(async (status) => {
       const q = bookings.where("bookingStatus", "==", status);
-      const agg = await q
-        .aggregate({
-          count: AggregateField.count(),
-          gross: AggregateField.sum("grossAmount"),
-          commission: AggregateField.sum("commissionAmount"),
-          net: AggregateField.sum("photographerNetAmount"),
-        })
-        .get();
+      const agg = await q.aggregate({ count: AggregateField.count(), ...MONEY_SUMS }).get();
       const d = agg.data();
       return { status, count: d.count, gross: d.gross ?? 0, commission: d.commission ?? 0, net: d.net ?? 0 };
     }),

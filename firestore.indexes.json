@@ -1,4 +1,15 @@
 {
-  "indexes": [],
+  "indexes": [
+    {
+      "collectionGroup": "bookings",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "bookingStatus", "order": "ASCENDING" },
+        { "fieldPath": "commissionAmount", "order": "ASCENDING" },
+        { "fieldPath": "grossAmount", "order": "ASCENDING" },
+        { "fieldPath": "photographerNetAmount", "order": "ASCENDING" }
+      ]
+    }
+  ],
   "fieldOverrides": []
 }
