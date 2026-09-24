@@ -1,10 +1,14 @@
 import "server-only";
 
-import type { DocumentSnapshot } from "firebase-admin/firestore";
-
 import { docId, forbidden, notFound } from "@/lib/api/http";
 import { adminDb } from "@/lib/firebase/admin";
-import { collections, studioSubcollections } from "@/lib/firestore/paths";
+import {
+  collections,
+  STUDIO_CONTACT_DOC,
+  STUDIO_INTERNAL_DOC,
+  STUDIO_PRIVATE,
+  studioSubcollections,
+} from "@/lib/firestore/paths";
 import { toMinorUnits } from "@/lib/money";
 import type { PackageInput } from "@/lib/validation/schemas";
 import type {
@@ -17,7 +21,9 @@ import type {
   GalleryImageDoc,
   PackageDoc,
   PortfolioPhotoDoc,
+  StudioContactDoc,
   StudioDoc,
+  StudioInternalDoc,
 } from "@/types/models";
 
 import { toIso } from "./serialize";
@@ -29,21 +35,31 @@ export const studioRef = (studioId: string) =>
 export const studioSub = (studioId: string, sub: keyof typeof studioSubcollections) =>
   studioRef(studioId).collection(studioSubcollections[sub]);
 
-function toStudioDTO(snap: DocumentSnapshot): StudioDTO {
-  const d = snap.data() as StudioDoc;
+export const studioContactRef = (studioId: string) =>
+  studioRef(studioId).collection(STUDIO_PRIVATE).doc(STUDIO_CONTACT_DOC);
+
+export const studioInternalRef = (studioId: string) =>
+  studioRef(studioId).collection(STUDIO_PRIVATE).doc(STUDIO_INTERNAL_DOC);
+
+/** Server-only: the private internal record (owner, commission, moderation). */
+export async function getStudioInternal(studioId: string): Promise<StudioInternalDoc | null> {
+  const snap = await studioInternalRef(studioId).get();
+  return snap.exists ? (snap.data() as StudioInternalDoc) : null;
+}
+
+function toStudioDTO(id: string, d: StudioDoc, contact: StudioContactDoc | undefined): StudioDTO {
   return {
-    id: snap.id,
-    ownerId: d.ownerId,
+    id,
     slug: d.slug,
     businessName: d.businessName,
     description: d.description,
     city: d.location.city,
     area: d.location.area,
-    address: d.location.address,
-    phone: d.phone,
-    email: d.email,
-    website: d.website ?? null,
-    instagram: d.instagram ?? null,
+    address: contact?.address ?? null,
+    phone: contact?.phone ?? "",
+    email: contact?.email ?? null,
+    website: contact?.website ?? null,
+    instagram: contact?.instagram ?? null,
     categories: d.categories,
     yearsOfExperience: d.yearsOfExperience ?? null,
     facilities: d.facilities,
@@ -60,26 +76,35 @@ function toStudioDTO(snap: DocumentSnapshot): StudioDTO {
   };
 }
 
-/** The signed-in photographer's studio (one per photographer in the MVP). */
+/**
+ * The signed-in photographer's studio (one per photographer in the MVP),
+ * including its private contact details. Ownership is verified against the
+ * server-written private/internal record.
+ */
 export async function getOwnedStudio(uid: string): Promise<StudioDTO | null> {
   const studioId = await getUserStudioId(uid);
   if (!studioId) return null;
-  const snap = await studioRef(studioId).get();
-  if (!snap.exists || snap.get("ownerId") !== uid) return null;
-  return toStudioDTO(snap);
+  const [snap, internal, contact] = await adminDb().getAll(
+    studioRef(studioId),
+    studioInternalRef(studioId),
+    studioContactRef(studioId),
+  );
+  if (!snap.exists || internal.get("ownerId") !== uid) return null;
+  return toStudioDTO(snap.id, snap.data() as StudioDoc, contact.data() as StudioContactDoc | undefined);
 }
 
 /**
- * Ownership gate for API routes: the studio must exist and its ownerId must be
- * the verified session uid. Admins are NOT owners — studio content edits are
- * the photographer's; admin moderation uses dedicated routes.
+ * Ownership gate for API routes: the studio must exist and its private
+ * internal ownerId must be the verified session uid. Admins are NOT owners —
+ * studio content edits are the photographer's; admin moderation uses
+ * dedicated routes. Returns the public studio document.
  */
 export async function assertStudioOwner(studioId: string, uid: string): Promise<StudioDoc> {
-  const snap = await studioRef(docId(studioId, "Studio")).get();
+  const id = docId(studioId, "Studio");
+  const [snap, internal] = await adminDb().getAll(studioRef(id), studioInternalRef(id));
   if (!snap.exists) throw notFound("Studio");
-  const studio = snap.data() as StudioDoc;
-  if (studio.ownerId !== uid) throw forbidden();
-  return studio;
+  if (internal.get("ownerId") !== uid) throw forbidden();
+  return snap.data() as StudioDoc;
 }
 
 export async function listPortfolio(studioId: string): Promise<PortfolioPhotoDTO[]> {

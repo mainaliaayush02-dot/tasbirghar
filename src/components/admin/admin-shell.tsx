@@ -15,19 +15,18 @@ import { icons } from "./icons";
 function Brand() {
   return (
     <Link href="/admin" className="flex items-center gap-3 rounded-lg focus-visible:outline-2 focus-visible:outline-brand-500">
-      <Image
-        src="/brand/tasbirghar-mark.png"
-        alt=""
-        width={36}
-        height={36}
-        className="rounded-lg ring-1 ring-black/5"
-        priority
-      />
+      <Image src="/brand/tasbirghar-mark.png" alt="" width={256} height={256} className="size-10" sizes="40px" preload />
       <span className="leading-tight">
-        <span className="block text-[15px] font-semibold tracking-tight text-ink">
-          Tasbir<span className="text-brand-600">Ghar</span>
-        </span>
-        <span className="block text-[11px] font-medium tracking-wide text-neutral-500 uppercase">
+        <Image
+          src="/brand/tasbirghar-wordmark.png"
+          alt="TasbirGhar"
+          width={900}
+          height={165}
+          className="h-[18px] w-auto"
+          sizes="100px"
+          preload
+        />
+        <span className="mt-1 block text-[11px] font-medium tracking-wide text-neutral-500 uppercase">
           Owner console
         </span>
       </span>

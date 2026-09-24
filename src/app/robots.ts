@@ -15,7 +15,8 @@ export default function robots(): MetadataRoute.Robots {
     rules: {
       userAgent: "*",
       allow: "/",
-      disallow: [...PRIVATE_PATH_PREFIXES],
+      // Private areas + booking forms (also noindex) + auth pages.
+      disallow: [...PRIVATE_PATH_PREFIXES, "/photographers/*/book", "/login", "/signup"],
     },
     sitemap: absoluteUrl("/sitemap.xml"),
   };

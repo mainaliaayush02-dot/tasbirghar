@@ -13,6 +13,7 @@ import { assertStudioOwner, studioRef, studioSub } from "@/lib/data/studios";
 import { adminDb } from "@/lib/firebase/admin";
 import { validate } from "@/lib/validation/core";
 import { galleryUpdateSchema, portfolioUpdateSchema } from "@/lib/validation/schemas";
+import { invalidateMarketplace } from "@/lib/data/revalidate";
 import type { MediaAsset } from "@/types/media";
 
 type Context = { params: Promise<{ studioId: string; collection: string; itemId: string }> };
@@ -43,6 +44,7 @@ export const PATCH = apiRoute<Context>(async (request, context) => {
   const snap = await ref.get();
   if (!snap.exists) throw notFound("Photo");
   await ref.update({ ...input, updatedAt: FieldValue.serverTimestamp() });
+  invalidateMarketplace();
   return Response.json({ ok: true });
 });
 
@@ -60,5 +62,6 @@ export const DELETE = apiRoute<Context>(async (_request, context) => {
   });
 
   await deleteImageQuietly(image?.publicId);
+  invalidateMarketplace();
   return Response.json({ ok: true });
 });

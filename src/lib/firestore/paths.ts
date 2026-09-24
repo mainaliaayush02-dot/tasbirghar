@@ -8,6 +8,8 @@ export const collections = {
   studioSlugs: "studioSlugs",
   photographerApplications: "photographerApplications",
   bookings: "bookings",
+  /** Server-only per-studio-per-day lock docs that serialize booking writes. */
+  bookingLocks: "bookingLocks",
   reviews: "reviews",
 } as const;
 
@@ -26,3 +28,8 @@ export type StudioSubcollection =
 export function studioSubcollectionPath(studioId: string, sub: StudioSubcollection) {
   return `${collections.studios}/${studioId}/${sub}`;
 }
+
+/** Private, server-written studio sub-documents (see StudioContactDoc / StudioInternalDoc). */
+export const STUDIO_PRIVATE = "private";
+export const STUDIO_CONTACT_DOC = "contact";
+export const STUDIO_INTERNAL_DOC = "internal";

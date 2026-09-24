@@ -137,11 +137,11 @@ const studio = (slug, extra = {}) => ({
   description: "A calm, safe studio for newborn and maternity sessions in Kathmandu.",
   city: "kathmandu",
   area: "Baneshwor",
-  address: null,
+  address: "Private Lane 7, Old Baneshwor",
   phone: "9812345678",
-  email: "studio@example.com",
-  website: null,
-  instagram: null,
+  email: "studio-contact@example.com",
+  website: "private-site.example.com",
+  instagram: "private.handle",
   categories: ["newborn"],
   yearsOfExperience: 5,
   facilities: ["Parking", "AC"],
@@ -166,6 +166,14 @@ const pkg = (extra = {}) => ({
   sortOrder: 0,
   ...extra,
 });
+
+/** The public studio doc must never carry owner / contact / internal fields. */
+function assertNoPrivateFields(doc) {
+  for (const key of ["ownerId", "phone", "email", "website", "instagram", "commissionRateBps", "lastModeration"]) {
+    assert.equal(key in doc, false, `public studio doc has ${key}`);
+  }
+  assert.equal("address" in doc.location, false, "public studio doc has location.address");
+}
 
 /* -------------------------------------------------------------------- state */
 
@@ -373,8 +381,17 @@ describe("studio creation (server-authoritative)", () => {
     S.studioA = res.json.studioId;
     assert.equal(res.json.slug, `alice-studio-${RUN}`);
     const doc = (await db.doc(`studios/${S.studioA}`).get()).data();
-    assert.equal(doc.ownerId, S.alice.uid);
-    assert.equal(doc.commissionRateBps, 800);
+    const internal = (await db.doc(`studios/${S.studioA}/private/internal`).get()).data();
+    const contact = (await db.doc(`studios/${S.studioA}/private/contact`).get()).data();
+    assert.equal(internal.ownerId, S.alice.uid);
+    assert.equal(internal.commissionRateBps, 800);
+    assert.equal(internal.lastModeration, null);
+    assert.equal(contact.phone, "+9779812345678");
+    assert.equal(contact.email, "studio-contact@example.com");
+    assert.equal(contact.address, "Private Lane 7, Old Baneshwor");
+    assert.equal(contact.instagram, "private.handle");
+    assertNoPrivateFields(doc);
+    assert.equal(doc.publishedAt, null);
     assert.equal(doc.listingStatus, "draft");
     assert.equal(doc.verificationStatus, "unverified");
     assert.equal(doc.currency, "NPR");
@@ -400,8 +417,34 @@ describe("studio creation (server-authoritative)", () => {
     assert.equal(withCommission.status, 422);
     const doc = (await db.doc(`studios/${S.studioA}`).get()).data();
     assert.equal(doc.businessName, "Alice Studio Renamed");
-    assert.equal(doc.commissionRateBps, 800);
+    assert.equal((await db.doc(`studios/${S.studioA}/private/internal`).get()).get("commissionRateBps"), 800);
     assert.equal(doc.slug, `alice-studio-${RUN}`);
+    assertNoPrivateFields(doc);
+  });
+
+  test("contact edits are written to private/contact only, never to the public doc", async () => {
+    const res = await call(S.alice, "PUT", `/api/studios/${S.studioA}`, {
+      ...profileOf(studio("x")),
+      businessName: "Alice Studio Renamed",
+      team: "Alice + 1 assistant",
+      phone: "9801112233",
+      email: "alice-owner@example.com",
+    });
+    assert.equal(res.status, 200, JSON.stringify(res.json));
+    const contact = (await db.doc(`studios/${S.studioA}/private/contact`).get()).data();
+    assert.equal(contact.phone, "+9779801112233");
+    assert.equal(contact.email, "alice-owner@example.com");
+    assertNoPrivateFields((await db.doc(`studios/${S.studioA}`).get()).data());
+    // Put the fixture values back for the later leak checks.
+    assert.equal((await call(S.alice, "PUT", `/api/studios/${S.studioA}`, { ...profileOf(studio("x")), businessName: "Alice Studio Renamed", team: "Alice + 1 assistant" })).status, 200);
+  });
+
+  test("the owner's dashboard shows their private contact; another owner's does not", async () => {
+    const mine = await fetch(`${BASE}/dashboard/studio`, { headers: { Cookie: S.alice.cookie } }).then((r) => r.text());
+    assert.ok(mine.includes("studio-contact@example.com"), "owner sees own email");
+    assert.ok(mine.includes("Private Lane 7"), "owner sees own address");
+    const other = await fetch(`${BASE}/dashboard/studio`, { headers: { Cookie: S.bob.cookie } }).then((r) => r.text());
+    assert.ok(!other.includes(S.studioA), "B's dashboard is not about studio A");
   });
 });
 
@@ -637,10 +680,14 @@ describe("studio moderation (server route, admin claim)", () => {
     const res = await moderate(S.admin, S.studioA, { action: "publish", reason: null });
     assert.equal(res.status, 200, JSON.stringify(res.json));
     const doc = (await db.doc(`studios/${S.studioA}`).get()).data();
+    const internal = (await db.doc(`studios/${S.studioA}/private/internal`).get()).data();
     assert.equal(doc.listingStatus, "published");
-    assert.equal(doc.lastModeration.action, "publish");
-    assert.equal(doc.lastModeration.by, S.admin.uid);
-    assert.equal(doc.commissionRateBps, 800, "moderation never touches commission");
+    assert.ok(doc.publishedAt, "publishedAt set on publish");
+    assertNoPrivateFields(doc);
+    assert.equal(internal.lastModeration.action, "publish");
+    assert.equal(internal.lastModeration.by, S.admin.uid);
+    assert.equal(internal.ownerId, S.alice.uid, "moderation never touches ownership");
+    assert.equal(internal.commissionRateBps, 800, "moderation never touches commission");
     const log = await db.collection(`studios/${S.studioA}/moderationLog`).get();
     assert.equal(log.size, 1);
     assert.equal(log.docs[0].get("to.listingStatus"), "published");
@@ -669,7 +716,16 @@ describe("studio moderation (server route, admin claim)", () => {
     assert.equal(ok.status, 200);
     const doc = (await db.doc(`studios/${S.studioA}`).get()).data();
     assert.equal(doc.verificationStatus, "verified");
-    assert.equal(doc.lastModeration.action, "verify");
+    assert.equal((await db.doc(`studios/${S.studioA}/private/internal`).get()).get("lastModeration.action"), "verify");
+  });
+
+  test("admin studio detail shows the private contact, owner and commission", async () => {
+    const res = await fetch(`${BASE}/admin/studios/${S.studioA}`, { headers: { Cookie: S.admin.cookie } });
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.ok(html.includes("studio-contact@example.com"), "admin sees contact email");
+    assert.ok(html.includes("Private Lane 7"), "admin sees address");
+    assert.ok(html.includes("+9779812345678"), "admin sees phone");
   });
 });
 
@@ -713,7 +769,252 @@ describe("review moderation (server route, admin claim)", () => {
   });
 });
 
-/* ============================================================== 8. logout */
+/* ============================================ 8. public marketplace (P3) */
+
+const nepalToday = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kathmandu" });
+const plusDays = (n) => {
+  const d = new Date(`${nepalToday()}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+const page = async (path, user) => {
+  const res = await fetch(`${BASE}${path}`, { redirect: "manual", headers: user ? { Cookie: user.cookie } : {} });
+  return { status: res.status, html: await res.text(), location: res.headers.get("location") };
+};
+
+describe("public marketplace visibility (published only)", () => {
+  test("a draft studio is not public anywhere", async () => {
+    const slug = (await db.doc(`studios/${S.studioA}`).get()).get("slug");
+    S.slugA = slug;
+    S.slugB = (await db.doc(`studios/${S.studioB}`).get()).get("slug");
+    assert.equal((await db.doc(`studios/${S.studioA}`).get()).get("listingStatus"), "draft");
+    assert.equal((await page(`/photographers/${slug}`)).status, 404);
+    assert.doesNotMatch((await page("/photographers")).html, new RegExp(`/photographers/${slug}"`));
+    assert.doesNotMatch((await page("/sitemap.xml")).html, new RegExp(slug));
+    assert.equal((await call(null, "GET", `/api/studios/${S.studioA}/availability?date=${plusDays(10)}`)).status, 404);
+    const alias = await page(`/studios/${slug}`);
+    assert.equal(alias.status, 308);
+    assert.match(alias.location, new RegExp(`/photographers/${slug}$`));
+  });
+
+  test("after publishing, the studio appears (cache invalidated immediately)", async () => {
+    assert.equal((await call(S.admin2 ?? S.admin, "POST", `/api/admin/studios/${S.studioA}`, { action: "publish", reason: null })).status, 200);
+    const profile = await page(`/photographers/${S.slugA}`);
+    assert.equal(profile.status, 200);
+    assert.match(profile.html, /Request a booking/);
+    assert.match(profile.html, /Rs\. 15,000/);
+    assert.match(profile.html, /"@type":"ProfessionalService"/);
+    assert.match(profile.html, /<link rel="canonical" href="[^"]*\/photographers\//);
+    assert.match((await page("/photographers")).html, new RegExp(`/photographers/${S.slugA}"`));
+    assert.match((await page("/categories/newborn")).html, new RegExp(`/photographers/${S.slugA}"`));
+    assert.match((await page("/sitemap.xml")).html, new RegExp(`/photographers/${S.slugA}</loc>`));
+  });
+
+  test("public pages never expose private studio data", async () => {
+    const html = (await page(`/photographers/${S.slugA}`)).html + (await page("/photographers")).html + (await page("/packages")).html;
+    const contact = (await db.doc(`studios/${S.studioA}/private/contact`).get()).data();
+    const internal = (await db.doc(`studios/${S.studioA}/private/internal`).get()).data();
+    assert.ok(!html.includes(contact.phone) && !html.includes(contact.phone.slice(4)), "studio phone");
+    assert.ok(!html.includes(contact.email), "studio email");
+    assert.ok(!html.includes("Private Lane 7"), "street address");
+    assert.ok(!html.includes(contact.website) && !html.includes("private.handle"), "website / instagram");
+    assert.ok(!html.includes(internal.ownerId), "owner uid");
+    assert.doesNotMatch(html, /commissionRateBps|commissionAmount|photographerNet|lastModeration/);
+    assertNoPrivateFields((await db.doc(`studios/${S.studioA}`).get()).data());
+  });
+
+  test("public studio pages still render (profile, listings, categories, locations, packages, booking)", async () => {
+    const name = (await db.doc(`studios/${S.studioA}`).get()).get("businessName");
+    for (const path of [`/photographers/${S.slugA}`, "/photographers", "/categories/newborn", "/locations/kathmandu", "/packages"]) {
+      const res = await page(path);
+      assert.equal(res.status, 200, path);
+      assert.ok(res.html.includes(name), path);
+    }
+    assert.equal((await page("/")).status, 200);
+    const book = await page(`/photographers/${S.slugA}/book`, S.carol);
+    assert.equal(book.status, 200);
+    assert.ok(book.html.includes(name));
+    assert.ok(!book.html.includes("studio-contact@example.com") && !book.html.includes("Private Lane 7"), "booking page leaks contact");
+  });
+
+  test("path traversal / malformed slugs are 404", async () => {
+    for (const slug of ["..%2F..%2Fadmin", "a%2Fb", "UPPER", "x"]) {
+      assert.equal((await page(`/photographers/${slug}`)).status, 404, slug);
+    }
+  });
+});
+
+describe("booking creation (server-authoritative)", () => {
+  const book = (user, extra = {}) =>
+    call(user, "POST", "/api/bookings", {
+      studioId: S.studioA,
+      packageId: S.pkgA,
+      shootDate: plusDays(14),
+      startTime: "10:00",
+      customerName: "Dev Customer",
+      customerPhone: "9811111111",
+      customerNote: null,
+      ...extra,
+    });
+
+  before(async () => {
+    const pkgs = await db.collection(`studios/${S.studioA}/packages`).where("isActive", "==", true).get();
+    S.pkgA = pkgs.docs[0].id;
+    S.pkgAPrice = pkgs.docs[0].get("price");
+    S.pkgADuration = pkgs.docs[0].get("durationMinutes");
+    S.dave = await login(`dave-${RUN}@example.com`, { signup: true, profile: { displayName: "Dave", phone: null } });
+    S.erin = await login(`erin-${RUN}@example.com`, { signup: true, profile: { displayName: "Erin", phone: null } });
+  });
+
+  test("requires a signed-in customer account", async () => {
+    assert.equal((await book(null)).status, 401);
+    assert.equal((await book(S.alice)).status, 403);
+    assert.equal((await book(S.admin2 ?? S.admin)).status !== 201, true);
+  });
+
+  test("client cannot set price, commission, owner, status or end time", async () => {
+    for (const extra of [{ grossAmount: 1 }, { price: 1 }, { commissionRateBps: 0 }, { studioOwnerId: S.dave.uid }, { bookingStatus: "confirmed" }, { endTime: "23:00" }, { paymentStatus: "paid" }]) {
+      assert.equal((await book(S.dave, extra)).status, 422, JSON.stringify(extra));
+    }
+  });
+
+  test("validates dates, times, studio and package", async () => {
+    for (const shootDate of [nepalToday(), plusDays(-3), plusDays(400), "2026-02-30", "tomorrow"]) {
+      assert.equal((await book(S.dave, { shootDate })).status, 422, shootDate);
+    }
+    assert.equal((await book(S.dave, { startTime: "10:15" })).status, 422);
+    assert.equal((await book(S.dave, { startTime: "25:00" })).status, 422);
+    assert.equal((await book(S.dave, { studioId: S.studioB })).status, 404, "unpublished studio");
+    assert.equal((await book(S.dave, { studioId: "a/b" })).status, 422, "malformed id");
+    assert.equal((await book(S.dave, { packageId: "nope" })).status, 404);
+    assert.equal((await book(S.dave, { customerPhone: "123" })).status, 422);
+  });
+
+  test("creates a pending booking priced from Firestore (paisa + commission)", async () => {
+    const res = await book(S.dave);
+    assert.equal(res.status, 201, JSON.stringify(res.json));
+    S.bookingDave = res.json.bookingId;
+    const b = (await db.doc(`bookings/${S.bookingDave}`).get()).data();
+    assert.equal(b.bookingStatus, "pending");
+    assert.equal(b.customerId, S.dave.uid);
+    assert.equal(b.studioOwnerId, S.alice.uid);
+    assert.equal(b.grossAmount, S.pkgAPrice);
+    assert.equal(b.commissionRateBps, 800);
+    assert.equal(b.commissionAmount + b.photographerNetAmount, b.grossAmount);
+    assert.equal(b.commissionAmount, Math.floor((S.pkgAPrice * 800 + 5000) / 10000));
+    assert.equal(b.packageSnapshot.price, S.pkgAPrice);
+    assert.equal(b.startTime, "10:00");
+    const end = 10 * 60 + S.pkgADuration;
+    assert.equal(b.endTime, `${String(Math.floor(end / 60)).padStart(2, "0")}:${String(end % 60).padStart(2, "0")}`);
+  });
+
+  test("no double booking: same and overlapping times are rejected, adjacent is allowed", async () => {
+    assert.equal((await book(S.erin)).status, 409);
+    assert.equal((await book(S.erin, { startTime: "10:30" })).status, 409);
+    const endTime = (await db.doc(`bookings/${S.bookingDave}`).get()).get("endTime");
+    const adjacent = await book(S.erin, { startTime: endTime });
+    assert.equal(adjacent.status, 201, JSON.stringify(adjacent.json));
+    S.bookingErin = adjacent.json.bookingId;
+    const day = await call(null, "GET", `/api/studios/${S.studioA}/availability?date=${plusDays(14)}`);
+    assert.equal(day.status, 200);
+    assert.equal(day.json.busy.length, 2);
+  });
+
+  test("concurrent requests for the same slot: exactly one succeeds", async () => {
+    const racers = await Promise.all(
+      [1, 2, 3, 4, 5].map((i) => login(`racer${i}-${RUN}@example.com`, { signup: true, profile: { displayName: `Racer ${i}`, phone: null } })),
+    );
+    const results = await Promise.all(racers.map((u) => book(u, { shootDate: plusDays(20), startTime: "09:00" })));
+    const statuses = results.map((r) => r.status).sort();
+    assert.deepEqual(statuses, [201, 409, 409, 409, 409], JSON.stringify(results.map((r) => r.json)));
+    const snap = await db.collection("bookings").where("studioId", "==", S.studioA).where("shootDate", "==", plusDays(20)).get();
+    assert.equal(snap.size, 1);
+  });
+
+  test("studio availability: closed days and restricted hours are enforced", async () => {
+    const closed = plusDays(25);
+    await db.doc(`studios/${S.studioA}/availability/${closed}`).set({ studioId: S.studioA, date: closed, isClosed: true, slots: [] });
+    assert.equal((await book(S.erin, { shootDate: closed })).status, 409);
+    const limited = plusDays(26);
+    await db.doc(`studios/${S.studioA}/availability/${limited}`).set({
+      studioId: S.studioA, date: limited, isClosed: false,
+      slots: [{ start: "10:00", end: "14:00", status: "open", bookingId: null }],
+    });
+    assert.equal((await book(S.erin, { shootDate: limited, startTime: "15:00" })).status, 409);
+    assert.equal((await book(S.erin, { shootDate: limited, startTime: "10:00" })).status, 201);
+  });
+
+  test("editing the package later never changes an existing booking's price", async () => {
+    const res = await call(S.alice, "PUT", `/api/studios/${S.studioA}/packages/${S.pkgA}`, pkg({ priceNpr: 99000 }));
+    assert.equal(res.status, 200);
+    assert.equal((await db.doc(`bookings/${S.bookingDave}`).get()).get("grossAmount"), S.pkgAPrice);
+    await call(S.alice, "PUT", `/api/studios/${S.studioA}/packages/${S.pkgA}`, pkg({ priceNpr: S.pkgAPrice / 100 }));
+  });
+});
+
+describe("booking transitions and customer pages", () => {
+  test("customers see only their own bookings", async () => {
+    assert.equal((await page(`/account/bookings/${S.bookingDave}`, S.dave)).status, 200);
+    assert.equal((await page(`/account/bookings/${S.bookingDave}`, S.erin)).status, 404);
+    assert.equal((await page("/account/bookings", S.dave)).status, 200);
+  });
+
+  test("only the booking's customer can cancel, only while pending", async () => {
+    assert.equal((await call(S.erin, "POST", `/api/bookings/${S.bookingDave}`, { action: "cancel" })).status, 404);
+    assert.equal((await call(S.dave, "POST", `/api/bookings/${S.bookingDave}`, { action: "confirm" })).status, 403);
+    assert.equal((await call(S.dave, "POST", `/api/bookings/${S.bookingDave}`, { action: "cancel" })).status, 200);
+    assert.equal((await call(S.dave, "POST", `/api/bookings/${S.bookingDave}`, { action: "cancel" })).status, 409);
+    // The freed window can be requested again.
+    assert.equal((await call(S.dave, "POST", "/api/bookings", {
+      studioId: S.studioA, packageId: S.pkgA, shootDate: plusDays(14), startTime: "10:00",
+      customerName: "Dave", customerPhone: "9811111111", customerNote: null,
+    })).status, 201);
+  });
+
+  test("only the studio owner confirms; completion waits for the shoot date", async () => {
+    assert.equal((await call(S.bob, "POST", `/api/bookings/${S.bookingErin}`, { action: "confirm" })).status, 404);
+    assert.equal((await call(S.admin2 ?? S.admin, "POST", `/api/bookings/${S.bookingErin}`, { action: "confirm" })).status, 403);
+    assert.equal((await call(S.alice, "POST", `/api/bookings/${S.bookingErin}`, { action: "confirm" })).status, 200);
+    assert.equal((await db.doc(`bookings/${S.bookingErin}`).get()).get("bookingStatus"), "confirmed");
+    assert.equal((await call(S.alice, "POST", `/api/bookings/${S.bookingErin}`, { action: "complete" })).status, 409);
+    assert.equal((await call(S.alice, "POST", `/api/bookings/${S.bookingErin}`, { action: "bogus" })).status, 422);
+    assert.equal((await page("/dashboard/bookings", S.alice)).status, 200);
+  });
+
+  test("a customer can hold at most 5 pending requests", async () => {
+    const results = [];
+    for (let i = 0; i < 6; i++) {
+      results.push((await call(S.erin, "POST", "/api/bookings", {
+        studioId: S.studioA, packageId: S.pkgA, shootDate: plusDays(40 + i), startTime: "09:00",
+        customerName: "Erin", customerPhone: "9811111112", customerNote: null,
+      })).status);
+    }
+    // Erin already has 1 pending (restricted-hours test) → 4 more allowed, then 429.
+    assert.deepEqual(results, [201, 201, 201, 201, 429, 429]);
+  });
+
+  test("suspending the studio removes it from public view immediately", async () => {
+    assert.equal((await call(S.admin2 ?? S.admin, "POST", `/api/admin/studios/${S.studioA}`, { action: "suspend", reason: "Test suspension" })).status, 200);
+    assert.equal((await page(`/photographers/${S.slugA}`)).status, 404);
+    assert.doesNotMatch((await page("/photographers")).html, new RegExp(`/photographers/${S.slugA}"`));
+    assert.doesNotMatch((await page("/sitemap.xml")).html, new RegExp(S.slugA));
+    assert.equal((await call(null, "GET", `/api/studios/${S.studioA}/availability?date=${plusDays(30)}`)).status, 404);
+    assert.equal((await call(S.erin, "POST", "/api/bookings", {
+      studioId: S.studioA, packageId: S.pkgA, shootDate: plusDays(60), startTime: "09:00",
+      customerName: "Erin", customerPhone: "9811111112", customerNote: null,
+    })).status, 404);
+  });
+
+  test("public header session endpoint reveals only display data", async () => {
+    const anonRes = await call(null, "GET", "/api/auth/session");
+    assert.deepEqual(anonRes.json, { user: null });
+    const me = await call(S.dave, "GET", "/api/auth/session");
+    assert.deepEqual(Object.keys(me.json.user).sort(), ["displayName", "home", "role"]);
+    assert.equal(me.json.user.role, "customer");
+  });
+});
+
+/* ============================================================== 9. logout */
 
 describe("logout", () => {
   test("DELETE /api/auth/session clears the cookie", async () => {

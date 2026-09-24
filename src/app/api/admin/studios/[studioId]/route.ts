@@ -9,9 +9,10 @@ import {
   requireApiUser,
   validated,
 } from "@/lib/api/http";
-import { studioRef, studioSub } from "@/lib/data/studios";
+import { studioInternalRef, studioRef, studioSub } from "@/lib/data/studios";
 import { adminDb } from "@/lib/firebase/admin";
 import { validate } from "@/lib/validation/core";
+import { invalidateMarketplace } from "@/lib/data/revalidate";
 import {
   studioModerationSchema,
   type StudioModerationAction,
@@ -45,9 +46,10 @@ const PAST: Record<StudioModerationAction, string> = {
  * POST /api/admin/studios/{studioId} { action, reason? }
  *
  * Admin-only studio moderation (live `admin` claim). Changes listing or
- * verification status in a transaction and records who/when/why in
- * `lastModeration` plus an append-only `moderationLog` entry. Owners can never
- * reach these fields (Firestore rules + owner routes exclude them).
+ * verification status in a transaction and records who/when/why in the
+ * private `private/internal.lastModeration` plus an append-only
+ * `moderationLog` entry (neither is client-readable). Owners can never reach
+ * these fields (Firestore rules + owner routes exclude them).
  */
 export const POST = apiRoute<Context>(async (request, { params }) => {
   const admin = await requireApiUser("admin");
@@ -96,8 +98,12 @@ export const POST = apiRoute<Context>(async (request, { params }) => {
       update.verificationStatus = verification.to;
     }
 
+    if (action === "publish") update.publishedAt = FieldValue.serverTimestamp();
+
     const entry = { action, by: admin.uid, at: FieldValue.serverTimestamp(), reason };
-    tx.update(ref, { ...update, lastModeration: entry });
+    // Public doc gets only the public status change; who/why stays private.
+    tx.update(ref, update);
+    tx.set(studioInternalRef(studioId), { lastModeration: entry, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
     tx.create(studioSub(studioId, "moderationLog").doc(), {
       ...entry,
       from: { listingStatus: studio.listingStatus, verificationStatus: studio.verificationStatus },
@@ -109,5 +115,6 @@ export const POST = apiRoute<Context>(async (request, { params }) => {
     return update;
   });
 
+  invalidateMarketplace();
   return Response.json({ ok: true, ...result });
 });

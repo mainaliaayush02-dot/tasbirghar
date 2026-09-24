@@ -10,6 +10,7 @@ const NAV = [
   { href: "/dashboard/portfolio", label: "Portfolio" },
   { href: "/dashboard/gallery", label: "Studio photos" },
   { href: "/dashboard/packages", label: "Packages" },
+  { href: "/dashboard/bookings", label: "Bookings" },
   { href: "/dashboard/availability", label: "Availability", soon: true },
   { href: "/dashboard/verification", label: "Verification" },
   { href: "/account", label: "Account" },

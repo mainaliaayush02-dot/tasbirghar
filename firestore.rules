@@ -10,7 +10,8 @@ rules_version = '2';
 //   the Admin SDK). users/{uid}.role is a read-only mirror for the UI: clients
 //   may only ever create it as "customer" and can never change it.
 // - Sensitive writes happen server-side (Admin SDK bypasses these rules):
-//   studio creation (slug reservation, commission), moderation, bookings,
+//   studio creation (slug reservation, commission, private sub-documents),
+//   studio contact details, moderation, bookings,
 //   reviews, and every MediaAsset field (written by the media confirm step
 //   after verifying the asset with Cloudinary).
 // - Admins are READ-ONLY here. Admin mutations go through server routes so
@@ -36,8 +37,13 @@ service cloud.firestore {
     function studio(studioId) {
       return get(/databases/$(database)/documents/studios/$(studioId)).data;
     }
+    // Ownership comes from users/{uid}.studioId, which only server code writes
+    // (in the studio-creation transaction): clients must create it as null and
+    // it is not in the users update allowlist. The public studio doc carries
+    // no ownerId; server code uses studios/{id}/private/internal.ownerId.
     function ownsStudio(studioId) {
-      return signedIn() && studio(studioId).ownerId == request.auth.uid;
+      return signedIn()
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.studioId == studioId;
     }
     function canReadStudioContent(studioId) {
       return studio(studioId).listingStatus == 'published' || ownsStudio(studioId) || isAdmin();
@@ -64,24 +70,42 @@ service cloud.firestore {
     }
 
     // -------------------------------------------------------------- studios
+    // studios/{studioId} is the PUBLIC document (anyone may read it once
+    // published), so it holds marketplace fields only. Contact details, the
+    // owner id, commission and moderation data live in private/* below.
     match /studios/{studioId} {
       allow read: if resource.data.listingStatus == 'published'
-        || (signedIn() && resource.data.ownerId == request.auth.uid)
+        || ownsStudio(studioId)
         || isAdmin();
 
       // Created only by server code (onboarding API), which atomically reserves
-      // studioSlugs/{slug} and sets server-controlled fields (commissionRateBps,
-      // stats, statuses) — a client create could otherwise set its own
-      // commission rate.
+      // studioSlugs/{slug} and writes the private sub-documents — a client
+      // create could otherwise set its own commission rate.
       allow create: if false;
 
-      // Owners edit profile text. ownerId, slug, statuses, stats, pricing
-      // summary, commission, currency and media are server/admin controlled.
-      allow update: if signedIn() && resource.data.ownerId == request.auth.uid
-        && onlyChanges(['businessName', 'description', 'phone', 'email', 'location',
-                        'categories', 'facilities', 'props', 'updatedAt']);
+      // Owners edit profile text. Slug, statuses, stats, pricing summary,
+      // currency and media are server/admin controlled. Contact fields are not
+      // allowed here (they belong in private/contact), and `location` may only
+      // hold public keys, so private data can never be put on the public doc.
+      allow update: if ownsStudio(studioId)
+        && onlyChanges(['businessName', 'description', 'location',
+                        'categories', 'facilities', 'props', 'updatedAt'])
+        && incoming().location.keys().hasOnly(['city', 'area', 'geo']);
 
       allow delete: if false;
+
+      // Private sub-documents, written only by server code:
+      //   private/contact   phone, email, street address, website, instagram
+      //                     readable by the studio owner and admins
+      //   private/internal  ownerId, commissionRateBps, lastModeration
+      //                     readable by admins only
+      // Single-document reads only; never listable, never client-writable.
+      match /private/{docId} {
+        allow get: if (docId == 'contact' && (ownsStudio(studioId) || isAdmin()))
+          || (docId == 'internal' && isAdmin());
+        allow list: if false;
+        allow write: if false;
+      }
 
       // Portfolio & gallery docs are created by the server media confirm
       // step; owners may edit presentation fields but never the image.

@@ -9,6 +9,7 @@
  * emulator's tasbirghar-f285b namespace (and can never reach production).
  */
 
+import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { after, before, beforeEach, describe, test } from "node:test";
 
@@ -19,6 +20,7 @@ import {
 } from "@firebase/rules-unit-testing";
 import {
   collection,
+  collectionGroup,
   deleteDoc,
   doc,
   getDoc,
@@ -59,14 +61,13 @@ const userDoc = (role, extra = {}) => ({
   ...extra,
 });
 
-const studioDoc = (ownerId, slug, listingStatus, profileImage) => ({
-  ownerId,
+// The PUBLIC studio document: marketplace fields only. Owner, contact,
+// commission and moderation data live in studios/{id}/private/*.
+const studioDoc = (slug, listingStatus, profileImage) => ({
   businessName: `Studio ${slug}`,
   slug,
   description: "Newborn and maternity studio",
-  phone: "9800000001",
-  email: `${slug}@example.com`,
-  location: { city: "kathmandu", area: "Baneshwor", address: null, geo: null },
+  location: { city: "kathmandu", area: "Baneshwor", geo: null },
   categories: ["newborn"],
   profileImage,
   coverImage: profileImage,
@@ -76,8 +77,25 @@ const studioDoc = (ownerId, slug, listingStatus, profileImage) => ({
   listingStatus,
   startingPrice: 1500000,
   currency: "NPR",
-  commissionRateBps: null,
+  publishedAt: null,
   stats: { ratingAverage: 4.8, reviewCount: 3, portfolioCount: 1, completedBookings: 3 },
+  createdAt: "2026-01-01",
+  updatedAt: "2026-01-01",
+});
+
+const contactDoc = (slug) => ({
+  phone: "9800000001",
+  email: `${slug}@example.com`,
+  address: "Private street 1",
+  website: null,
+  instagram: null,
+  updatedAt: "2026-01-01",
+});
+
+const internalDoc = (ownerId) => ({
+  ownerId,
+  commissionRateBps: 800,
+  lastModeration: null,
   createdAt: "2026-01-01",
   updatedAt: "2026-01-01",
 });
@@ -218,8 +236,12 @@ beforeEach(async () => {
       ["users/pb", userDoc("photographer", { studioId: "studioB" })],
       ["users/admin", userDoc("admin")],
       // studioA is published; studioB is a draft (not public).
-      ["studios/studioA", studioDoc("pa", "studio-a", "published", MEDIA_A)],
-      ["studios/studioB", studioDoc("pb", "studio-b", "draft", MEDIA_B)],
+      ["studios/studioA", studioDoc("studio-a", "published", MEDIA_A)],
+      ["studios/studioB", studioDoc("studio-b", "draft", MEDIA_B)],
+      ["studios/studioA/private/contact", contactDoc("studio-a")],
+      ["studios/studioA/private/internal", internalDoc("pa")],
+      ["studios/studioB/private/contact", contactDoc("studio-b")],
+      ["studios/studioB/private/internal", internalDoc("pb")],
       ["studios/studioA/portfolio/p1", portfolioDoc("studioA", MEDIA_A)],
       ["studios/studioB/portfolio/p1", portfolioDoc("studioB", MEDIA_B)],
       ["studios/studioA/gallery/g1", galleryDoc("studioA", MEDIA_A)],
@@ -264,7 +286,7 @@ describe("unauthenticated", () => {
     await assertFails(updateDoc(ref(anon(), "users/alice"), { displayName: "x" }));
   });
   test("cannot create or modify studios", async () => {
-    await assertFails(setDoc(ref(anon(), "studios/new"), studioDoc("x", "new", "draft", null)));
+    await assertFails(setDoc(ref(anon(), "studios/new"), studioDoc("new", "draft", null)));
     await assertFails(updateDoc(ref(anon(), "studios/studioA"), { businessName: "x" }));
   });
   test("cannot create portfolio / gallery / packages / availability", async () => {
@@ -337,7 +359,7 @@ describe("customer", () => {
     await assertFails(updateDoc(ref(customer(), "users/alice"), { isVerified: true }));
   });
   test("cannot create a studio directly or edit a studio", async () => {
-    await assertFails(setDoc(ref(customer(), "studios/mine"), studioDoc("alice", "mine", "draft", null)));
+    await assertFails(setDoc(ref(customer(), "studios/mine"), studioDoc("mine", "draft", null)));
     await assertFails(updateDoc(ref(customer(), "studios/studioA"), { businessName: "x" }));
     await assertFails(updateDoc(ref(customer(), "studios/studioA"), { commissionRateBps: 0 }));
   });
@@ -404,13 +426,19 @@ describe("role escalation", () => {
     await assertFails(getDoc(ref(mallory, "bookings/b1")));
     await assertFails(getDoc(ref(mallory, "studios/studioB")));
   });
-  test("a Firestore role field grants nothing: role=photographer + studioId without ownership", async () => {
+  test("a photographer claim alone owns nothing (ownership = server-written users/{uid}.studioId)", async () => {
     await env.withSecurityRulesDisabled((ctx) =>
-      setDoc(ref(ctx.firestore(), "users/mallory"), userDoc("photographer", { studioId: "studioA" })),
+      setDoc(ref(ctx.firestore(), "users/mallory"), userDoc("photographer")),
     );
     const mallory = photographer("mallory");
     await assertFails(updateDoc(ref(mallory, "studios/studioA"), { businessName: "x" }));
     await assertFails(setDoc(ref(mallory, "studios/studioA/packages/x"), packageDoc("studioA")));
+    await assertFails(getDoc(ref(mallory, "studios/studioB")));
+    await assertFails(getDoc(ref(mallory, "studios/studioA/private/contact")));
+    // …and cannot claim a studio by writing studioId itself.
+    await assertFails(updateDoc(ref(mallory, "users/mallory"), { studioId: "studioA" }));
+    await assertFails(updateDoc(ref(photographer("pa"), "users/pa"), { studioId: "studioB" }));
+    await assertFails(setDoc(ref(customer("eve"), "users/eve"), userDoc("customer", { studioId: "studioA" })));
   });
   test("customer-claim user is treated like any customer", async () => {
     await assertFails(setDoc(ref(customerWithClaim(), "users/alice"), userDoc("admin")));
@@ -426,11 +454,11 @@ describe("role escalation", () => {
 
 describe("photographer (owner of studioA)", () => {
   test("cannot create a studio directly (server-only)", async () => {
-    await assertFails(setDoc(ref(photographer(), "studios/new"), studioDoc("pa", "new", "draft", null)));
+    await assertFails(setDoc(ref(photographer(), "studios/new"), studioDoc("new", "draft", null)));
     // Overwriting own studio with a full doc that changes protected fields.
     await assertFails(
       setDoc(ref(photographer(), "studios/studioA"), {
-        ...studioDoc("pa", "studio-a", "published", MEDIA_A),
+        ...studioDoc("studio-a", "published", MEDIA_A),
         commissionRateBps: 0,
       }),
     );
@@ -440,9 +468,7 @@ describe("photographer (owner of studioA)", () => {
       updateDoc(ref(photographer(), "studios/studioA"), {
         businessName: "Studio A Renamed",
         description: "Updated",
-        phone: "9800000009",
-        email: "new@example.com",
-        location: { city: "lalitpur", area: "Jhamsikhel", address: null, geo: null },
+        location: { city: "lalitpur", area: "Jhamsikhel", geo: null },
         categories: ["newborn", "maternity"],
         facilities: ["Parking", "AC"],
         props: ["Moon prop", "Basket"],
@@ -458,6 +484,13 @@ describe("photographer (owner of studioA)", () => {
 
   for (const [field, value] of [
     ["ownerId", "mallory"],
+    ["ownerId", "pa"],
+    ["phone", "9800000009"],
+    ["email", "leak@example.com"],
+    ["website", "https://example.com"],
+    ["instagram", "leak"],
+    ["lastModeration", null],
+    ["publishedAt", "2026-01-01"],
     ["slug", "better-slug"],
     ["commissionRateBps", 0],
     ["commissionRateBps", 100],
@@ -482,6 +515,17 @@ describe("photographer (owner of studioA)", () => {
     await assertFails(updateDoc(ref(pb, "studios/studioB"), { listingStatus: "published" }));
     await assertFails(updateDoc(ref(pb, "studios/studioB"), { listingStatus: "pending_review" }));
     await assertFails(updateDoc(ref(pb, "studios/studioB"), { verificationStatus: "rejected" }));
+  });
+
+  test("cannot put private contact data inside the public location map", async () => {
+    const db = photographer();
+    await assertFails(
+      updateDoc(ref(db, "studios/studioA"), { location: { city: "kathmandu", area: "Baneshwor", address: "Street 1", geo: null } }),
+    );
+    await assertFails(
+      updateDoc(ref(db, "studios/studioA"), { location: { city: "kathmandu", area: "Baneshwor", geo: null, phone: "98" } }),
+    );
+    await assertFails(updateDoc(ref(db, "studios/studioA"), { "location.address": "Street 1" }));
   });
 
   test("cannot sneak a protected field alongside allowed ones", () =>
@@ -680,7 +724,7 @@ describe("admin (read-only in rules; mutations are server-side)", () => {
   });
   test("cannot write via client SDK: studios, commission, listing, media", async () => {
     const db = admin();
-    await assertFails(setDoc(ref(db, "studios/new"), studioDoc("x", "new", "draft", null)));
+    await assertFails(setDoc(ref(db, "studios/new"), studioDoc("new", "draft", null)));
     await assertFails(updateDoc(ref(db, "studios/studioB"), { listingStatus: "published" }));
     await assertFails(updateDoc(ref(db, "studios/studioA"), { commissionRateBps: 500 }));
     await assertFails(updateDoc(ref(db, "studios/studioA"), { profileImage: MEDIA_B }));
@@ -727,7 +771,7 @@ describe("photographerApplications are server-only", () => {
   test("approval side effects cannot be forged: role mirror and studioId stay server-only", async () => {
     await assertFails(updateDoc(ref(customer("alice"), "users/alice"), { role: "photographer" }));
     await assertFails(updateDoc(ref(customer("alice"), "users/alice"), { studioId: "studioA" }));
-    await assertFails(setDoc(ref(customer("alice"), "studios/aliceStudio"), studioDoc("alice", "alice", "draft", null)));
+    await assertFails(setDoc(ref(customer("alice"), "studios/aliceStudio"), studioDoc("alice", "draft", null)));
     await assertFails(setDoc(ref(customer("alice"), "studioSlugs/alice"), { studioId: "aliceStudio" }));
   });
   test("server-written Phase 2 studio fields are not client-writable", async () => {
@@ -763,3 +807,87 @@ describe("moderation state is server-only", () => {
   });
 });
 
+
+/* ------------------------------------------ private studio sub-documents */
+
+describe("private studio contact / internal documents", () => {
+  const CONTACT_A = "studios/studioA/private/contact";
+  const INTERNAL_A = "studios/studioA/private/internal";
+
+  test("signed-out users cannot read private contact or internal docs (even of a published studio)", async () => {
+    await assertFails(getDoc(ref(anon(), CONTACT_A)));
+    await assertFails(getDoc(ref(anon(), INTERNAL_A)));
+    await assertFails(getDoc(ref(anon(), "studios/studioB/private/contact")));
+    await assertFails(getDocs(collection(anon(), "studios/studioA/private")));
+  });
+  test("customers cannot read any studio's private docs", async () => {
+    for (const db of [customer(), customerWithClaim()]) {
+      await assertFails(getDoc(ref(db, CONTACT_A)));
+      await assertFails(getDoc(ref(db, INTERNAL_A)));
+      await assertFails(getDocs(collection(db, "studios/studioA/private")));
+    }
+  });
+  test("another photographer cannot read another studio's private contact", async () => {
+    await assertFails(getDoc(ref(photographer("pb"), CONTACT_A)));
+    await assertFails(getDoc(ref(photographer("pa"), "studios/studioB/private/contact")));
+    await assertFails(getDoc(ref(photographer("pb"), INTERNAL_A)));
+  });
+  test("the owner CAN read their own contact doc", async () => {
+    await assertSucceeds(getDoc(ref(photographer("pa"), CONTACT_A)));
+    await assertSucceeds(getDoc(ref(photographer("pb"), "studios/studioB/private/contact")));
+  });
+  test("the owner cannot read their internal doc (owner id / commission / moderation are admin-only)", () =>
+    assertFails(getDoc(ref(photographer("pa"), INTERNAL_A))));
+  test("private docs cannot be listed or queried, even by the owner", async () => {
+    await assertFails(getDocs(collection(photographer("pa"), "studios/studioA/private")));
+    await assertFails(getDocs(collectionGroup(photographer("pa"), "private")));
+    await assertFails(getDocs(collectionGroup(anon(), "private")));
+  });
+  test("admin CAN read both private docs (read-only)", async () => {
+    await assertSucceeds(getDoc(ref(admin(), CONTACT_A)));
+    await assertSucceeds(getDoc(ref(admin(), INTERNAL_A)));
+    await assertSucceeds(getDoc(ref(admin(), "studios/studioB/private/contact")));
+  });
+  test("nobody can write private docs from the client (server-only)", async () => {
+    for (const db of [anon(), customer(), photographer("pa"), photographer("pb"), admin()]) {
+      await assertFails(updateDoc(ref(db, CONTACT_A), { phone: "9811111111" }));
+      await assertFails(setDoc(ref(db, CONTACT_A), contactDoc("x")));
+      await assertFails(updateDoc(ref(db, INTERNAL_A), { commissionRateBps: 0 }));
+      await assertFails(updateDoc(ref(db, INTERNAL_A), { ownerId: "mallory" }));
+      await assertFails(setDoc(ref(db, "studios/studioA/private/other"), { x: 1 }));
+      await assertFails(deleteDoc(ref(db, CONTACT_A)));
+    }
+  });
+  test("other private doc ids are unreadable", async () => {
+    await env.withSecurityRulesDisabled((ctx) => setDoc(doc(ctx.firestore(), "studios/studioA/private/other"), { x: 1 }));
+    await assertFails(getDoc(ref(photographer("pa"), "studios/studioA/private/other")));
+    await assertFails(getDoc(ref(admin(), "studios/studioA/private/other")));
+  });
+  test("the public studio document holds no private fields", async () => {
+    const snap = await assertSucceeds(getDoc(ref(anon(), "studios/studioA")));
+    const data = snap.data();
+    for (const key of ["ownerId", "phone", "email", "website", "instagram", "commissionRateBps", "lastModeration"]) {
+      assert.equal(key in data, false, `public studio doc exposes ${key}`);
+    }
+    assert.equal("address" in data.location, false);
+  });
+});
+
+/* --------------------------------------------------------- bookings (P3) */
+
+describe("booking writes stay server-only (Phase 3)", () => {
+  const lock = { studioId: "studioA", date: "2026-10-01", writes: 1 };
+
+  test("no client can read or write booking lock documents", async () => {
+    for (const db of [anon(), customer(), photographer(), admin()]) {
+      await assertFails(getDoc(ref(db, "bookingLocks/studioA_2026-10-01")));
+      await assertFails(setDoc(ref(db, "bookingLocks/studioA_2026-10-01"), lock));
+    }
+  });
+  test("customers cannot create, confirm or re-price bookings from the client", async () => {
+    await assertFails(setDoc(ref(customer(), "bookings/fake"), { ...bookingDoc("alice", "studioA", "pa"), grossAmount: 1 }));
+    await assertFails(updateDoc(ref(customer(), "bookings/b1"), { bookingStatus: "confirmed" }));
+    await assertFails(updateDoc(ref(customer(), "bookings/b1"), { bookingStatus: "cancelled_by_customer" }));
+    await assertFails(updateDoc(ref(photographer(), "bookings/b1"), { bookingStatus: "confirmed" }));
+  });
+});

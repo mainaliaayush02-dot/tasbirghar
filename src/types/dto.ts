@@ -49,9 +49,9 @@ export interface ApplicationDTO {
   rejectionReason: string | null;
 }
 
+/** Owner-dashboard view: public studio fields merged with private contact. */
 export interface StudioDTO {
   id: string;
-  ownerId: string;
   slug: string;
   businessName: string;
   description: string;

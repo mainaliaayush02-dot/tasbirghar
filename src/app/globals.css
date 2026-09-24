@@ -12,16 +12,18 @@
   --font-mono: var(--font-geist-mono);
 }
 
-/* TasbirGhar brand — sampled from the logo: burnt orange, charcoal, warm cream. */
+/* TasbirGhar brand — sampled from the official logo (public/brand/logo.png):
+   background cream #fcf7f1, ink #302828, "Ghar" orange #b06038. */
 @theme {
-  --color-brand-50: #fbf4ec;
-  --color-brand-100: #f5e4d2;
-  --color-brand-200: #e9c7a6;
-  --color-brand-500: #c2733c;
-  --color-brand-600: #ac5d2a;
-  --color-brand-700: #8a4920;
-  --color-ink: #2b2623;
-  --color-cream: #fbf7f1;
+  --color-brand-50: #fbf3ec;
+  --color-brand-100: #f4e2d3;
+  --color-brand-200: #e8c6a8;
+  --color-brand-500: #c2713f;
+  --color-brand-600: #b06038;
+  --color-brand-700: #8f4c2b;
+  --color-ink: #302828;
+  --color-cream: #fcf7f1;
+  --font-display: var(--font-fraunces), ui-serif, Georgia, serif;
 }
 
 body {

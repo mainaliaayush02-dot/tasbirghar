@@ -27,6 +27,7 @@ npm run dev                  # http://localhost:3000
 | `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET` | Cloudinary console → Settings → API Keys (**server only, never `NEXT_PUBLIC_`**) |
 | `FIREBASE_ADMIN_PROJECT_ID`, `FIREBASE_ADMIN_CLIENT_EMAIL`, `FIREBASE_ADMIN_PRIVATE_KEY` | Firebase console → Project settings → Service accounts → Generate new private key (**server only**). Paste the key on one line with `\n` escapes, in double quotes. |
 | `NEXT_PUBLIC_APP_URL` | `http://localhost:3000` locally, or the production domain on Vercel |
+| `NEXT_PUBLIC_CONTACT_EMAIL` | Optional public support email shown on `/contact` |
 
 Never commit `.env.local`. In production, set the same variables in Vercel → Project → Settings → Environment Variables.
 

@@ -28,6 +28,7 @@ src/
     (customer)/account customer area, noindex
     (studio)/dashboard photographer/studio area, noindex
     (admin)/admin      admin area, noindex
+    (auth)             /login, /signup (noindex)
     api/               route handlers (server only)
     dev/               development-only tools (404 in production)
     robots.ts, sitemap.ts
@@ -159,7 +160,9 @@ Documents stay small and bounded. Anything that grows without limit lives in a s
 
 ```
 users/{uid}                                 UserDoc
-studios/{studioId}                          StudioDoc      (profile, location, categories, denormalized stats/startingPrice)
+studios/{studioId}                          StudioDoc      (PUBLIC: profile, city/area, categories, denormalized stats/startingPrice)
+studios/{studioId}/private/contact          StudioContactDoc  (phone, email, street address, website, instagram; owner + admin read)
+studios/{studioId}/private/internal         StudioInternalDoc (ownerId, commissionRateBps, lastModeration; admin read)
 studios/{studioId}/portfolio/{photoId}      PortfolioPhotoDoc
 studios/{studioId}/gallery/{imageId}        GalleryImageDoc (kind: studio | setup | prop)
 studios/{studioId}/packages/{packageId}     PackageDoc
@@ -172,6 +175,8 @@ reviews/{bookingId}                         ReviewDoc      (doc id = bookingId �
 The full types are in `src/types/models.ts`. Collection names are in `src/lib/firestore/paths.ts`.
 
 Design notes:
+
+- **Public vs private studio data.** Once a studio is published, anyone can read `studios/{id}`, so it holds marketplace fields only: no owner uid, contact details, street address, commission or moderation state. Those live in two server-written sub-documents under `private/`. `contact` can be read by the owner (for the dashboard form) and by admins; `internal` is admin-only. Neither can be listed or written from the client. Server code treats `private/internal.ownerId` as the owner of record; the rules check ownership through `users/{uid}.studioId`, which only the server writes.
 
 - **Search and filtering.** `StudioDoc` stores `categories[]`, `location.city` and `startingPrice` (the lowest active package price, maintained server-side). Listing pages can filter by category, location and budget with a single query on `studios`.
 - **Package-level search.** `PackageDoc` repeats `studioId` and `category`, so a collection-group query on `packages` can answer "newborn packages under Rs. 20,000" across all studios. Composite indexes go in `firestore.indexes.json` as queries are added.
@@ -233,10 +238,11 @@ The custom claim `role` is authoritative. `users/{uid}.role` is only a mirror, a
    - rolls the claim back if that transaction fails
 3. **Create the studio.** The photographer submits `/dashboard/studio`, which calls `POST /api/studios`. In one transaction the server:
    - normalizes the slug and reserves `studioSlugs/{slug}`
-   - creates `studios/{id}` with `ownerId` taken from the session, `commissionRateBps: 800`, `listingStatus: "draft"`, `verificationStatus: "unverified"`, zeroed `stats`, and no media
+   - creates the public `studios/{id}` with `listingStatus: "draft"`, `verificationStatus: "unverified"`, zeroed `stats` and no media
+   - creates `studios/{id}/private/contact` (phone, email, street address, website, instagram) and `studios/{id}/private/internal` (`ownerId` taken from the session, `commissionRateBps: 800`, `lastModeration: null`)
    - sets `users/{uid}.studioId`
 
-   The schema rejects `ownerId`, commission, status and media fields if the browser sends them. MVP limit: one studio per photographer.
+   The schema rejects `ownerId`, commission, status and media fields if the browser sends them. Later profile edits (`PUT /api/studios/{id}`) write the public fields and `private/contact` in one batch. MVP limit: one studio per photographer.
 4. **Build the listing** in the dashboard: profile and cover images, portfolio, studio photos, and packages.
 
 ### Admin bootstrap (first admin)
@@ -274,7 +280,7 @@ The owner is an ordinary Firebase Auth account that has been given the `admin` c
 - **Screens:** dashboard KPIs and marketplace overview; applications; studios (filters, search, detail with portfolio, gallery, packages, availability and moderation); photographers; customers (masked phones); bookings; reviews; commission; read-only settings.
 - **Authorization:** the `(admin)` layout calls `requireUser("admin")` before anything streams, so non-admins get a real 404. Every page and route re-checks the live claim.
 - **Reads:** all through the Admin SDK in Server Components (`src/lib/data/admin.ts`). Counts and money totals use Firestore `count()` and `sum()` aggregations. List pages scan at most 500 recent documents and filter or search in memory, 20 per page. Replace this with a search index once collections grow.
-- **Writes:** only the server routes above. Every moderation action writes `lastModeration` plus an append-only `studios/{id}/moderationLog` entry (who, when, why, from → to). Clients can neither read nor write either one, which the rules tests cover.
+- **Writes:** only the server routes above. Every moderation action writes `private/internal.lastModeration` (and `publishedAt` on the public doc when publishing) plus an append-only `studios/{id}/moderationLog` entry (who, when, why, from → to). Clients can neither read nor write either one, which the rules tests cover.
 - **Publishing guard:** a studio needs a profile photo, at least one portfolio photo and one active package before it can be published.
 - **Recent activity** is derived from existing timestamps (applications, users, studios, bookings), since there is no event log yet. It is labelled as such, and nothing is invented.
 - **Missing records** (for example `/admin/studios/<unknown>`) render a not-found screen with a **200 status** and `noindex`. The pages stream behind `loading.tsx`, and Next.js commits the status before `notFound()` runs; see the Next docs, `loading.md` → Status Codes. The role check is unaffected.
@@ -302,16 +308,71 @@ The owner is an ordinary Firebase Auth account that has been given the `admin` c
 
 ---
 
-## 6. Booking flow (future)
+## 6. Public marketplace & booking (Phase 3)
 
-1. The customer picks a studio, package, date and slot. The slot must be `open` in `availability/{date}`.
-2. The client calls `POST /api/bookings`. The server verifies the ID token, **loads the package price from Firestore** (the client never supplies a price), computes the commission, marks the slot `held`, and writes the booking with `bookingStatus: "pending"` in one transaction.
-3. The studio confirms or declines. The slot becomes `booked` or is released back to `open`.
-4. Payment (eSewa or Khalti, in a later phase) moves `paymentStatus` to `paid`.
-5. After the shoot, the booking becomes `completed`, `payoutStatus` becomes `pending`, and the photographer is paid `photographerNetAmount`.
-6. The customer can then leave one review (`reviews/{bookingId}`), which is verified by construction.
+### Brand assets
 
-Statuses: `bookingStatus`, `paymentStatus` and `payoutStatus` are independent fields (see `models.ts`).
+The official logo is `public/brand/logo.png`: a 1254×1254 RGB lockup on cream `#fcf7f1`, moved byte-identical from the repository root. Every other rendition is an exact **crop or resize** of it; nothing is redrawn or recolored.
+
+| File | What it is | Used in |
+| --- | --- | --- |
+| `public/brand/tasbirghar-mark.png` | the mark, padded square with the logo's own cream | header, admin, empty states |
+| `public/brand/tasbirghar-wordmark.png` | the "TasbirGhar" wordmark | header (inline next to the mark), admin sidebar |
+| `public/brand/tasbirghar-logo-lockup.png` | full lockup, margins trimmed | footer, auth pages, About, default Open Graph image |
+| `src/app/favicon.ico` (16/32/48), `icon.png` (512), `apple-icon.png` (180) | the mark | App Router icon conventions |
+
+The square lockup would be unreadably small at header height, so the header shows the original mark and wordmark side by side on the logo's exact cream, where the crops blend in. Design tokens (`--color-ink #302828`, `--color-brand-600 #b06038`, `--color-cream #fcf7f1`) were sampled from the logo. Headlines use Fraunces through `next/font`.
+
+### Public routes
+
+| Route | What |
+| --- | --- |
+| `/` | hero with search, categories, studios, featured portfolio, how it works, trust, photographer CTA |
+| `/photographers` | discovery (search, category, location, sort; GET form, server-rendered) |
+| `/photographers/[slug]` | canonical studio profile (portfolio lightbox, packages, studio photos, reviews, booking card) |
+| `/photographers/[slug]/book` | booking request (sign-in required; noindex) |
+| `/categories/[category]`, `/locations/[location]` | SEO landing pages |
+| `/packages` | packages across studios, filter by category, sort by price |
+| `/how-it-works`, `/about`, `/contact` | editorial pages (FAQ structured data on How it works) |
+| `/studios/[slug]` → 308 to `/photographers/[slug]`; `/search` → `/photographers` | aliases |
+
+The public header is **cookie-free**. The account area loads client-side from `GET /api/auth/session`, which returns display data only; authorization never depends on it. Signed-in customers get an account sub-navigation (Account · My bookings · Log out).
+
+### Visibility and caching
+
+- `src/lib/data/public.ts` is the only public read model. It returns studios with `listingStatus == "published"` **only**, and it reads only the public studio document, which by construction holds no phone, email, street address, owner uid, commission or moderation data (see section 4). It never reads `private/*`.
+- Reads are cached with `unstable_cache` under the tag `marketplace`, with a 300-second safety revalidation. Every mutation that can change public data calls `invalidateMarketplace()` = `revalidateTag("marketplace", { expire: 0 })`, so the next request is fresh and never stale: moderation, studio edits, media confirm and delete, portfolio and gallery edits, package CRUD and review moderation. A suspended studio disappears from its page, the listings and the sitemap immediately, and this is covered by an API test.
+- Public pages render per request (`force-dynamic`) from that cache, so `next build` never depends on Firestore.
+- There is deliberately no `loading.tsx` on public routes. Streaming would commit a 200 before `notFound()`, and unknown or unpublished studio URLs must return a real 404.
+- Listings and filters run in memory over at most 500 published studios, which is fine for the launch market. `/packages` reads each published studio's packages when the cache is refreshed. Move both to a search index as the catalogue grows. No new Firestore indexes were needed; a two-equality query such as `reviews` by studio and status is served by merging single-field indexes.
+
+### Booking architecture
+
+- **`POST /api/bookings`** is available to customer accounts only. The body carries intent only (studio, package, date, start time, contact, note); price, commission, payout, owner, end time and status are derived from Firestore, and the schema rejects them if sent.
+- **Rules** (`src/lib/booking/rules.ts`, shared by server and form): dates run from tomorrow to 180 days ahead in Asia/Kathmandu; start times fall on 30-minute steps; active (window-holding) statuses are `pending` and `confirmed`; a customer may hold at most 5 pending requests.
+- **The transaction** (`src/lib/booking/service.ts`):
+  1. Read `bookingLocks/{studioId}_{date}`, the day's availability doc, all bookings for that studio-day, and the studio again.
+  2. Reject if the studio is no longer published, the day is closed, the window is outside the open hours (published slots, or the default 07:00–20:00), or it overlaps an active booking.
+  3. Create the booking with `calculateCommission(packagePrice, internal.commissionRateBps ?? 800)` (read from `private/internal`, alongside the owner uid copied to `studioOwnerId`), then write the lock back.
+  Because every booking write for a studio-day reads and writes the same lock document, Firestore serializes those transactions, so two concurrent requests can't both pass the overlap check. An API test fires 5 simultaneous requests for one slot and exactly one succeeds.
+- **Availability is advisory.** Photographer-controlled `availability` docs can close a day or restrict hours, but existing bookings are the final authority. `GET /api/studios/{id}/availability?date=` (public, published studios only, `no-store`) shows open and busy windows to the form; the POST re-checks everything.
+- **Status changes, `POST /api/bookings/{id}`:**
+  - `cancel`: the customer, while the booking is pending.
+  - `confirm` and `decline`: the owner, while pending; confirm re-checks overlaps under the lock.
+  - `complete`: the owner, from the shoot date onward; this sets `payoutStatus: pending` and increments `stats.completedBookings`.
+  Owners are verified against both `studioOwnerId` and the current `private/internal.ownerId`. Admins have no booking write path.
+- **Pages:** `/account/bookings` and `/account/bookings/[id]` for customers (ownership-checked; no commission shown), `/dashboard/bookings` for studios (with their payout and TasbirGhar's commission), `/admin/bookings` for the owner.
+- **Not built yet:** online payment (eSewa or Khalti), payout processing, reviews submission and a studio availability editor. Bookings are requests confirmed by the studio, and customers are told that no payment is taken online.
+
+### SEO
+
+- **Metadata:** `buildMetadata()` sets the title, description, canonical, Open Graph and Twitter data per page. Next.js replaces rather than merges a parent's `openGraph`, so each page sets an image: by default the official lockup, and for studios a Cloudinary 1200×630 crop of the cover image. Filtered or sorted listing views are `noindex` and canonicalize to the clean listing.
+- **Structured data (JSON-LD, real data only):**
+  - `Organization` and `WebSite` with a `SearchAction` (home)
+  - `ProfessionalService` with `makesOffer` from packages, plus `aggregateRating` only when completed-booking reviews exist (studio pages)
+  - `BreadcrumbList` (studio, category and location pages)
+  - `FAQPage` (How it works)
+- **Sitemap:** static pages, categories, locations and **published** studios only, with `lastModified`. `robots.txt` disallows the private areas, booking forms and auth pages, and blocks everything on preview deployments.
 
 ---
 
@@ -335,7 +396,7 @@ Example (the spec case), from `calculateCommission(1500000, 800)` in `src/lib/mo
 | commissionAmount | 120000 | Rs. 1,200 |
 | photographerNetAmount | 1380000 | Rs. 13,800 |
 
-The platform default is `DEFAULT_COMMISSION_RATE_BPS = 800`. A negotiated per-studio rate can be set in `StudioDoc.commissionRateBps` (admin or server only). The rate in effect is **copied onto every booking**, so a later rate change never alters past bookings. Currency is `NPR` only for now (`SUPPORTED_CURRENCIES`).
+The platform default is `DEFAULT_COMMISSION_RATE_BPS = 800`. A negotiated per-studio rate can be set in `studios/{id}/private/internal.commissionRateBps` (server only; admins can read it). The rate in effect is **copied onto every booking**, so a later rate change never alters past bookings. Currency is `NPR` only for now (`SUPPORTED_CURRENCIES`).
 
 ---
 
@@ -371,7 +432,7 @@ Local values go in `.env.local`, which is gitignored. Production and preview val
 
 1. **Secrets never reach the browser.** Only `NEXT_PUBLIC_*` values are inlined into client bundles. Cloudinary credentials are read only in `lib/env/server.ts` and `lib/cloudinary/config.ts`, both of which import `server-only`. The build output was scanned to confirm no Cloudinary secret or key strings appear in `.next/static`.
 2. **Firebase web config is public by design.** Protection comes from Firestore rules, and later from App Check and restrictions on the API key.
-3. **Deny by default.** `firestore.rules` closes every path except those explicitly opened. Clients can never write bookings or reviews. Those writes go through server code using the Admin SDK, so prices, commission and review eligibility can't be tampered with. Studios are **created only server-side**, because a client create could set its own `commissionRateBps` and the slug must be reserved atomically. Owners can't change moderation fields (`listingStatus`, `verificationStatus`), `stats`, `commissionRateBps`, `startingPrice` or `ownerId`. Roles come from custom claims, and clients can only ever write `role: "customer"`. **Media fields are server-written only.** These are `users.photo`, studio `profileImage`/`coverImage`, portfolio and gallery `image`, and package `images`. They're set by the media confirm step after the asset has been verified with Cloudinary. Portfolio and gallery docs are created server-side, and owners can edit only captions, order and category. A client therefore can't point a document at another studio's `publicId`.
+3. **Deny by default.** `firestore.rules` closes every path except those explicitly opened. Clients can never write bookings or reviews. Those writes go through server code using the Admin SDK, so prices, commission and review eligibility can't be tampered with. Studios are **created only server-side**, because a client create could set its own `commissionRateBps` and the slug must be reserved atomically. Owners can't change moderation fields (`listingStatus`, `verificationStatus`), `stats`, `startingPrice` or `publishedAt`, and can't put contact fields (or a street address inside `location`) on the public doc. Owner id, commission, moderation state and contact details live in `studios/{id}/private/*`, which clients can never write. Roles come from custom claims, and clients can only ever write `role: "customer"`. **Media fields are server-written only.** These are `users.photo`, studio `profileImage`/`coverImage`, portfolio and gallery `image`, and package `images`. They're set by the media confirm step after the asset has been verified with Cloudinary. Portfolio and gallery docs are created server-side, and owners can edit only captions, order and category. A client therefore can't point a document at another studio's `publicId`.
 4. **No anonymous uploads.** The only signing endpoint today, `/api/dev/cloudinary-test/sign`, returns 404 unless `NODE_ENV === "development"` (verified on a production build), and signs only for `tasbirghar/dev-tests/`. Production signing endpoints must verify the Firebase ID token and studio ownership before signing.
 5. **Destructive media operations** are restricted to public IDs under `tasbirghar/` and are always authorized by the caller.
 6. **Uploads are validated without trusting the browser.** Cloudinary enforces the signed `allowed_formats` on the decoded file, and the confirm step re-checks format, size and `asset_folder` from the Cloudinary Admin API.
@@ -380,20 +441,21 @@ Local values go in `.env.local`, which is gitignored. Production and preview val
 
 ### Firestore rules: what clients may do
 
-`firestore.rules` is deny-by-default and is covered by `tests/firestore-rules.test.mjs` (86 emulator tests). Client updates use **field allowlists**, so any field not listed is immutable from the client SDK.
+`firestore.rules` is deny-by-default and is covered by `tests/firestore-rules.test.mjs` (115 emulator tests). Client updates use **field allowlists**, so any field not listed is immutable from the client SDK.
 
 | Actor | Allowed | Everything else |
 | --- | --- | --- |
-| Anyone (signed out) | Read published studios and their portfolio, gallery, packages and availability. `get` a single `studioSlugs/{slug}`. Read published reviews. | Denied, including draft studios and listing slugs |
+| Anyone (signed out) | Read published studios and their portfolio, gallery, packages and availability. `get` a single `studioSlugs/{slug}`. Read published reviews. | Denied, including draft studios, listing slugs and every `studios/{id}/private/*` doc |
 | Signed-in user (customer) | Create own `users/{uid}` with `role: "customer"`, `studioId: null`, `photo: null`. Read own user doc. Update own `displayName`, `phone`, `updatedAt`. Read own bookings and own reviews. | Denied |
-| Photographer (claim, owner of the studio) | Update own studio: `businessName`, `description`, `phone`, `email`, `location`, `categories`, `facilities`, `props`, `updatedAt`. Portfolio: update `caption`, `category`, `sortOrder`, `isFeatured`, or delete. Gallery: update `caption`, `sortOrder`, or delete. Packages: create with `images: []`, NPR and an integer price; update details and price; delete. Availability: create, update `isClosed`/`slots`, delete. Read bookings where `studioOwnerId` is the photographer's uid. | Denied, including every other studio |
-| Admin (claim) | **Read** users, studios (including drafts) and their subcollections, bookings and reviews. | **All client writes denied.** Admin mutations (moderation, commission, role grants) go through server routes using the Admin SDK. |
-| Server (Admin SDK) | Everything, since it bypasses rules: studio creation and slug reservation, statuses, commission, stats, `startingPrice`, all `MediaAsset` fields, portfolio and gallery creation, package images, role claims and mirror, bookings, reviews. | n/a |
+| Photographer (owner: `users/{uid}.studioId` equals the studio id) | `get` own `private/contact` (not `private/internal`). Update own studio: `businessName`, `description`, `location` (keys `city`, `area`, `geo` only), `categories`, `facilities`, `props`, `updatedAt`. Portfolio: update `caption`, `category`, `sortOrder`, `isFeatured`, or delete. Gallery: update `caption`, `sortOrder`, or delete. Packages: create with `images: []`, NPR and an integer price; update details and price; delete. Availability: create, update `isClosed`/`slots`, delete. Read bookings where `studioOwnerId` is the photographer's uid. | Denied, including every other studio |
+| Admin (claim) | **Read** users, studios (including drafts) and their subcollections, `private/contact` and `private/internal` (single `get`), bookings and reviews. | **All client writes denied.** Admin mutations (moderation, commission, role grants) go through server routes using the Admin SDK. |
+| Server (Admin SDK) | Everything, since it bypasses rules: studio creation and slug reservation, `private/contact` and `private/internal`, statuses, commission, stats, `startingPrice`, all `MediaAsset` fields, portfolio and gallery creation, package images, role claims and mirror, bookings, reviews. | n/a |
 
 Run the tests with a Firestore emulator running (`npx firebase-tools emulators:start --only firestore --project tasbirghar-f285b`), then `npm run test:rules`. Deploy with `npx firebase-tools deploy --only firestore:rules --project tasbirghar-f285b`, and only after the tests pass.
 
 Notes for later phases:
 - Owners control availability `slots`. Booking code must re-check slot conflicts against `bookings` server-side and never trust a slot's `status`.
-- `bookings.studioOwnerId` is denormalized for rules. Any future studio ownership transfer must update it.
+- `bookings.studioOwnerId` is denormalized for rules. Any future studio ownership transfer must update it, together with `private/internal.ownerId` and both users' `studioId`.
+- Rules derive studio ownership from `users/{uid}.studioId` (one extra `get` per owner request). It is written only by the studio-creation transaction; clients must create it as `null` and cannot update it.
 - The `users/{uid}.email` mirror is client-set at sign-up. Server code must use the email from the verified ID token.
 - Field **types and sizes** for profile text aren't validated in rules. Phase 2 UI writes go through validated server routes, but an owner using the client SDK directly could still write oversized or odd values into the allowlisted fields of their **own** studio, such as `description` or `categories`. That affects only their own listing. Closing it means either removing those client-write allowances (the server now handles all writes) or adding type checks to the rules, which is a candidate for Phase 3.

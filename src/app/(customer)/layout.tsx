@@ -1,3 +1,4 @@
+import { AccountNav } from "@/components/account/account-nav";
 import { SiteHeader } from "@/components/site-header";
 import { noIndexMetadata } from "@/lib/seo";
 
@@ -11,6 +12,7 @@ export default function CustomerLayout({ children }: { children: React.ReactNode
   return (
     <div className="flex flex-1 flex-col bg-neutral-50">
       <SiteHeader />
+      <AccountNav />
       <div className="mx-auto w-full max-w-3xl flex-1 px-4 py-8 sm:px-6">{children}</div>
     </div>
   );

@@ -42,6 +42,17 @@ export default async function AccountPage() {
       </Card>
 
       {account.role === "customer" && (
+        <Card title="My bookings">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <p className="text-sm text-neutral-600">See your booking requests and confirmed sessions.</p>
+            <ButtonLink href="/account/bookings" variant="secondary">
+              View bookings
+            </ButtonLink>
+          </div>
+        </Card>
+      )}
+
+      {account.role === "customer" && (
         <Card title="Are you a photographer?">
           <div className="flex flex-wrap items-center justify-between gap-4">
             <p className="text-sm text-neutral-600">

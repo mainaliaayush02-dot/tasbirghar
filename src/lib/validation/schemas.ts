@@ -279,3 +279,43 @@ export const reviewModerationSchema: Schema<ReviewModerationInput> = {
   reason: optionalText({ max: 500, multiline: true }),
 };
 
+
+/* -------------------------------------------------------------- bookings */
+
+export interface BookingCreateInput {
+  studioId: string;
+  packageId: string;
+  shootDate: string;
+  startTime: string;
+  customerName: string;
+  customerPhone: string;
+  customerNote: string | null;
+}
+
+const docIdRule = text({ max: 128, pattern: /^[A-Za-z0-9_-]+$/, patternMessage: "Invalid id." });
+
+/**
+ * The client sends only WHAT it wants (studio, package, date, time, contact).
+ * Price, commission, owner, end time and status are all derived server-side
+ * — they are not in the schema, so sending them is rejected.
+ */
+export const bookingCreateSchema: Schema<BookingCreateInput> = {
+  studioId: docIdRule,
+  packageId: docIdRule,
+  shootDate: text({ max: 10, pattern: /^\d{4}-\d{2}-\d{2}$/, patternMessage: "Choose a date." }),
+  startTime: text({ max: 5, pattern: /^([01]\d|2[0-3]):[0-5]\d$/, patternMessage: "Choose a start time." }),
+  customerName: text({ min: 2, max: LIMITS.displayName }),
+  customerPhone: phone(),
+  customerNote: optionalText({ max: 500, multiline: true }),
+};
+
+export const BOOKING_ACTIONS = ["cancel", "confirm", "decline", "complete"] as const;
+export type BookingAction = (typeof BOOKING_ACTIONS)[number];
+
+export interface BookingActionInput {
+  action: BookingAction;
+}
+
+export const bookingActionSchema: Schema<BookingActionInput> = {
+  action: oneOf(BOOKING_ACTIONS, "Unknown action."),
+};

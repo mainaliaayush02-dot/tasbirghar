@@ -21,7 +21,9 @@ import type {
   BookingStatus,
   ReviewDoc,
   ReviewStatus,
+  StudioContactDoc,
   StudioDoc,
+  StudioInternalDoc,
   StudioListingStatus,
   StudioVerificationStatus,
   UserDoc,
@@ -30,7 +32,15 @@ import type {
 
 import { toApplicationDTO } from "./applications";
 import { toIso } from "./serialize";
-import { listGallery, listPackages, listPortfolio, studioRef, studioSub } from "./studios";
+import {
+  listGallery,
+  listPackages,
+  listPortfolio,
+  studioContactRef,
+  studioInternalRef,
+  studioRef,
+  studioSub,
+} from "./studios";
 
 /**
  * Admin read models. Callers MUST have verified the live `admin` claim
@@ -98,6 +108,20 @@ export async function authUsers(uids: string[]): Promise<Map<string, AuthSummary
         lastSignInAt: u.metadata.lastSignInTime ? new Date(u.metadata.lastSignInTime).toISOString() : null,
       });
     }
+  }
+  return map;
+}
+
+/** Batch-read studios' private internal docs (owner, commission, moderation). */
+async function internalsFor(studioIds: string[]): Promise<Map<string, StudioInternalDoc>> {
+  const map = new Map<string, StudioInternalDoc>();
+  for (let i = 0; i < studioIds.length; i += 200) {
+    const refs = studioIds.slice(i, i + 200).map((id) => studioInternalRef(id));
+    if (!refs.length) continue;
+    const snaps = await db().getAll(...refs);
+    snaps.forEach((snap, j) => {
+      if (snap.exists) map.set(studioIds[i + j], snap.data() as StudioInternalDoc);
+    });
   }
   return map;
 }
@@ -309,17 +333,19 @@ export async function listStudiosAdmin({
   let query: Query = db().collection(collections.studios);
   if (status) query = query.where("listingStatus", "==", status);
   const snap = await query.limit(LIST_SCAN_LIMIT).get();
-  const owners = await authUsers(snap.docs.map((d) => d.get("ownerId")));
+  const internals = await internalsFor(snap.docs.map((d) => d.id));
+  const owners = await authUsers([...internals.values()].map((i) => i.ownerId));
 
   const rows = snap.docs
     .map((d) => {
       const s = d.data() as StudioDoc;
-      const owner = owners.get(s.ownerId);
+      const ownerId = internals.get(d.id)?.ownerId ?? "";
+      const owner = owners.get(ownerId);
       return {
         id: d.id,
         businessName: s.businessName,
         slug: s.slug,
-        ownerId: s.ownerId,
+        ownerId,
         ownerEmail: owner?.email ?? null,
         ownerName: owner?.displayName ?? null,
         city: s.location.city,
@@ -348,6 +374,10 @@ export async function listStudiosAdmin({
 
 export interface AdminStudioDetail {
   studio: StudioDoc & { id: string };
+  /** Private contact (studios/{id}/private/contact). */
+  contact: { phone: string; email: string | null; address: string | null; website: string | null; instagram: string | null } | null;
+  /** Private per-studio commission override (null = platform default). */
+  commissionRateBps: number | null;
   owner: (AuthSummary & { uid: string }) | null;
   application: ApplicationDTO | null;
   portfolio: Awaited<ReturnType<typeof listPortfolio>>;
@@ -362,26 +392,38 @@ export interface AdminStudioDetail {
 
 export async function getStudioAdmin(studioId: string): Promise<AdminStudioDetail | null> {
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(studioId)) return null;
-  const snap = await studioRef(studioId).get();
+  const [snap, internalSnap, contactSnap] = await db().getAll(
+    studioRef(studioId),
+    studioInternalRef(studioId),
+    studioContactRef(studioId),
+  );
   if (!snap.exists) return null;
-  const studio = snap.data() as StudioDoc & { lastModeration?: { action: string; at: unknown; by: string; reason: string | null } };
+  const studio = snap.data() as StudioDoc;
+  const internal = internalSnap.data() as StudioInternalDoc | undefined;
+  const contact = contactSnap.data() as StudioContactDoc | undefined;
+  const ownerId = internal?.ownerId ?? "";
+  const moderation = internal?.lastModeration ?? null;
   const today = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kathmandu" });
 
   const [owners, application, portfolio, gallery, packages, availability, bookingCount] = await Promise.all([
-    authUsers([studio.ownerId, studio.lastModeration?.by ?? ""]),
-    db().collection(collections.photographerApplications).doc(studio.ownerId).get(),
+    authUsers([ownerId, moderation?.by ?? ""]),
+    ownerId ? db().collection(collections.photographerApplications).doc(ownerId).get() : Promise.resolve(null),
     listPortfolio(studioId),
     listGallery(studioId),
     listPackages(studioId),
     studioSub(studioId, "availability").orderBy(FieldPath.documentId()).startAt(today).limit(14).get(),
     count(db().collection(collections.bookings).where("studioId", "==", studioId)),
   ]);
-  const owner = owners.get(studio.ownerId);
+  const owner = owners.get(ownerId);
 
   return {
     studio: { ...studio, id: snap.id },
-    owner: owner ? { ...owner, uid: studio.ownerId } : null,
-    application: application.exists ? toApplicationDTO(application) : null,
+    contact: contact
+      ? { phone: contact.phone, email: contact.email, address: contact.address ?? null, website: contact.website, instagram: contact.instagram }
+      : null,
+    commissionRateBps: internal?.commissionRateBps ?? null,
+    owner: owner ? { ...owner, uid: ownerId } : null,
+    application: application?.exists ? toApplicationDTO(application) : null,
     portfolio,
     gallery,
     packages,
@@ -392,12 +434,12 @@ export async function getStudioAdmin(studioId: string): Promise<AdminStudioDetai
     bookingCount,
     createdAt: toIso(studio.createdAt),
     updatedAt: toIso(studio.updatedAt),
-    lastModeration: studio.lastModeration
+    lastModeration: moderation
       ? {
-          action: studio.lastModeration.action,
-          at: toIso(studio.lastModeration.at),
-          byEmail: owners.get(studio.lastModeration.by)?.email ?? null,
-          reason: studio.lastModeration.reason,
+          action: moderation.action,
+          at: toIso(moderation.at),
+          byEmail: owners.get(moderation.by)?.email ?? null,
+          reason: moderation.reason,
         }
       : null,
   };
@@ -566,18 +608,17 @@ export async function getCommissionOverview(): Promise<CommissionOverview> {
     }),
   );
 
-  const overrides = await db()
-    .collection(collections.studios)
-    .where("commissionRateBps", "!=", DEFAULT_COMMISSION_RATE_BPS)
-    .limit(100)
-    .get();
+  // Per-studio overrides live in the private internal docs; read them in a
+  // bounded batch (no collection-group index needed).
+  const studios = await db().collection(collections.studios).select("businessName").limit(LIST_SCAN_LIMIT).get();
+  const internals = await internalsFor(studios.docs.map((d) => d.id));
 
   return {
     defaultRateBps: DEFAULT_COMMISSION_RATE_BPS,
     byStatus,
-    overrides: overrides.docs
-      .filter((d) => typeof d.get("commissionRateBps") === "number")
-      .map((d) => ({ id: d.id, businessName: d.get("businessName"), rateBps: d.get("commissionRateBps") })),
+    overrides: studios.docs
+      .map((d) => ({ id: d.id, businessName: d.get("businessName") as string, rateBps: internals.get(d.id)?.commissionRateBps }))
+      .filter((o): o is { id: string; businessName: string; rateBps: number } => typeof o.rateBps === "number" && o.rateBps !== DEFAULT_COMMISSION_RATE_BPS),
   };
 }
 

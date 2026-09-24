@@ -78,8 +78,16 @@ export function ConfirmDialog({
         aria-labelledby={titleId}
         aria-describedby={descId}
         className="m-auto w-[calc(100%-2rem)] max-w-md rounded-2xl border border-neutral-200 bg-white p-0 text-neutral-900 shadow-xl backdrop:bg-ink/40 backdrop:backdrop-blur-[2px]"
-        onClose={close}
-        onCancel={(e) => pending && e.preventDefault()}
+        // Esc fires "cancel" synchronously; "close" arrives later (queued task).
+        // Sync state on cancel, and ignore a late "close" if the dialog has
+        // already been reopened — otherwise a quick re-open could be undone.
+        onCancel={(e) => {
+          if (pending) e.preventDefault();
+          else setIsOpen(false);
+        }}
+        onClose={(e) => {
+          if (!e.currentTarget.open) setIsOpen(false);
+        }}
         onClick={(e) => {
           if (e.target === e.currentTarget && !pending) close();
         }}

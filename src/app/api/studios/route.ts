@@ -1,6 +1,7 @@
 import { FieldValue } from "firebase-admin/firestore";
 
 import { apiRoute, ApiError, readJson, requireApiUser, validated } from "@/lib/api/http";
+import { studioContactRef, studioInternalRef } from "@/lib/data/studios";
 import { adminDb } from "@/lib/firebase/admin";
 import { collections } from "@/lib/firestore/paths";
 import { DEFAULT_COMMISSION_RATE_BPS } from "@/lib/money";
@@ -10,8 +11,10 @@ import { studioCreateSchema } from "@/lib/validation/schemas";
 /**
  * POST /api/studios — an approved photographer creates their studio.
  *
- * Server-controlled, never read from the body (the schema rejects them):
- * ownerId (session uid), commissionRateBps (platform default, 800),
+ * Writes three documents atomically: the public studio doc, private/contact
+ * (phone, email, street address, website, instagram) and private/internal (ownerId,
+ * commission). Server-controlled, never read from the body (the schema
+ * rejects them): ownerId (session uid), commissionRateBps (platform default, 800),
  * verificationStatus ("unverified"), listingStatus ("draft"), stats,
  * startingPrice, media. The slug is normalized and reserved atomically in
  * studioSlugs/{slug}; one studio per photographer.
@@ -36,16 +39,12 @@ export const POST = apiRoute(async (request) => {
       });
     }
 
+    // Public document: marketplace-facing fields only.
     tx.create(studioRef, {
-      ownerId: user.uid,
       slug: input.slug,
       businessName: input.businessName,
       description: input.description,
-      phone: input.phone,
-      email: input.email,
-      website: input.website,
-      instagram: input.instagram,
-      location: { city: input.city, area: input.area, address: input.address, geo: null },
+      location: { city: input.city, area: input.area, geo: null },
       categories: input.categories,
       yearsOfExperience: input.yearsOfExperience,
       facilities: input.facilities,
@@ -56,10 +55,27 @@ export const POST = apiRoute(async (request) => {
       coverImage: null,
       verificationStatus: "unverified",
       listingStatus: "draft",
+      publishedAt: null,
       startingPrice: null,
       currency: "NPR",
-      commissionRateBps: DEFAULT_COMMISSION_RATE_BPS,
       stats: { ratingAverage: 0, reviewCount: 0, portfolioCount: 0, completedBookings: 0 },
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+    // Private contact (owner + admin readable).
+    tx.create(studioContactRef(studioRef.id), {
+      phone: input.phone,
+      email: input.email,
+      address: input.address,
+      website: input.website,
+      instagram: input.instagram,
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+    // Private internal record (admin readable): authoritative owner + commission.
+    tx.create(studioInternalRef(studioRef.id), {
+      ownerId: user.uid,
+      commissionRateBps: DEFAULT_COMMISSION_RATE_BPS,
+      lastModeration: null,
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
     });

@@ -1,49 +1,37 @@
 import Link from "next/link";
 
-import { LogoutButton } from "@/components/auth/logout-button";
-import { ButtonLink } from "@/components/ui/button";
-import { siteConfig } from "@/config/site";
-import { getCurrentUser, homeForRole } from "@/lib/auth/current-user";
+import { AuthNav } from "@/components/public/auth-nav";
+import { BrandHomeLink } from "@/components/public/brand-logo";
+import { MobileMenu } from "@/components/public/mobile-menu";
+import { PUBLIC_NAV } from "@/components/public/nav";
 
-export async function SiteHeader() {
-  const user = await getCurrentUser();
-
+/**
+ * Public header. Rendered without reading cookies so public pages can use the
+ * marketplace data cache; the account area hydrates client-side. The cream
+ * background is the official logo's own background colour.
+ */
+export function SiteHeader() {
   return (
-    <header className="border-b border-neutral-200 bg-white">
-      <div className="mx-auto flex h-16 w-full max-w-6xl items-center justify-between gap-4 px-4 sm:px-6">
-        <Link href="/" className="flex items-baseline gap-2">
-          <span className="text-lg font-semibold tracking-tight text-neutral-900">
-            {siteConfig.name}
-          </span>
-          <span className="hidden text-sm text-neutral-400 sm:inline">{siteConfig.nameNe}</span>
-        </Link>
-        <nav className="flex items-center gap-1 sm:gap-2">
-          {user ? (
-            <>
-              {user.role === "customer" && (
-                <Link
-                  href="/become-a-photographer"
-                  className="hidden rounded-lg px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-100 sm:inline"
-                >
-                  For photographers
-                </Link>
-              )}
-              <ButtonLink href={homeForRole(user.role)} variant="secondary" size="sm">
-                {user.role === "customer" ? "My account" : user.role === "admin" ? "Admin" : "Dashboard"}
-              </ButtonLink>
-              <LogoutButton />
-            </>
-          ) : (
-            <>
-              <ButtonLink href="/login" variant="ghost" size="sm">
-                Log in
-              </ButtonLink>
-              <ButtonLink href="/signup" size="sm">
-                Sign up
-              </ButtonLink>
-            </>
-          )}
+    <header className="sticky top-0 z-40 border-b border-ink/10 bg-cream/95 backdrop-blur supports-[backdrop-filter]:bg-cream/85">
+      <div className="mx-auto flex h-[72px] w-full max-w-7xl items-center justify-between gap-4 px-4 sm:px-6 lg:px-8">
+        <BrandHomeLink />
+        <nav aria-label="Main" className="hidden items-center gap-1 md:flex">
+          {PUBLIC_NAV.map((item) => (
+            <Link
+              key={item.href}
+              href={item.href}
+              className="rounded-full px-3.5 py-2 text-sm text-ink/75 transition-colors hover:bg-ink/5 hover:text-ink lg:px-4"
+            >
+              {item.label}
+            </Link>
+          ))}
         </nav>
+        <div className="flex items-center gap-1">
+          <div className="hidden md:block">
+            <AuthNav />
+          </div>
+          <MobileMenu />
+        </div>
       </div>
     </header>
   );

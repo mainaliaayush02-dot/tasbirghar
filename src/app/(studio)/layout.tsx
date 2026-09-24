@@ -2,7 +2,7 @@ import Link from "next/link";
 
 import { LogoutButton } from "@/components/auth/logout-button";
 import { DashboardMobileNav, DashboardSidebar } from "@/components/dashboard/dashboard-nav";
-import { siteConfig } from "@/config/site";
+import { BrandLogo } from "@/components/public/brand-logo";
 import { requireUser } from "@/lib/auth/current-user";
 import { noIndexMetadata } from "@/lib/seo";
 
@@ -18,11 +18,11 @@ export default async function StudioLayout({ children }: { children: React.React
 
   return (
     <div className="flex flex-1 flex-col bg-neutral-50">
-      <header className="border-b border-neutral-200 bg-white">
-        <div className="mx-auto flex h-14 w-full max-w-7xl items-center justify-between gap-4 px-4 sm:px-6">
-          <Link href="/dashboard" className="flex items-baseline gap-2">
-            <span className="font-semibold tracking-tight">{siteConfig.name}</span>
-            <span className="text-xs font-medium tracking-wide text-brand-600 uppercase">Studio</span>
+      <header className="border-b border-ink/10 bg-cream">
+        <div className="mx-auto flex h-16 w-full max-w-7xl items-center justify-between gap-4 px-4 sm:px-6">
+          <Link href="/dashboard" className="flex items-center gap-2" aria-label="TasbirGhar studio dashboard">
+            <BrandLogo />
+            <span className="hidden text-xs font-medium tracking-wide text-brand-600 uppercase sm:inline">Studio</span>
           </Link>
           <div className="flex min-w-0 items-center gap-3">
             <span className="hidden truncate text-sm text-neutral-500 sm:inline">{user.email}</span>

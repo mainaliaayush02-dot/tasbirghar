@@ -1,5 +1,5 @@
 import { apiRoute, ApiError, readJson, validated } from "@/lib/api/http";
-import { homeForRole } from "@/lib/auth/current-user";
+import { getCurrentUser, homeForRole } from "@/lib/auth/current-user";
 import { roleFromClaims } from "@/lib/auth/roles";
 import { clearSession, createSession, readSession, SessionError } from "@/lib/auth/session";
 import { adminAuth } from "@/lib/firebase/admin";
@@ -47,6 +47,19 @@ export const POST = apiRoute(async (request) => {
   );
 
   return Response.json({ role, redirectTo: homeForRole(role) });
+});
+
+/**
+ * GET /api/auth/session — who is signed in (for the public header, which is
+ * rendered without reading cookies so public pages stay cacheable).
+ * Returns only display data; authorization never relies on this response.
+ */
+export const GET = apiRoute(async () => {
+  const user = await getCurrentUser();
+  return Response.json(
+    { user: user ? { role: user.role, displayName: user.displayName, home: homeForRole(user.role) } : null },
+    { headers: { "Cache-Control": "private, no-store" } },
+  );
 });
 
 /**

@@ -9,6 +9,7 @@ import {
 } from "@/lib/data/studios";
 import { validate } from "@/lib/validation/core";
 import { LIMITS, packageSchema } from "@/lib/validation/schemas";
+import { invalidateMarketplace } from "@/lib/data/revalidate";
 
 type Context = { params: Promise<{ studioId: string }> };
 
@@ -39,5 +40,6 @@ export const POST = apiRoute<Context>(async (request, { params }) => {
   });
   await refreshStartingPrice(studioId);
 
+  invalidateMarketplace();
   return Response.json({ id: ref.id }, { status: 201 });
 });

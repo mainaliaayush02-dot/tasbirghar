@@ -63,27 +63,25 @@ export interface StudioLocation {
   city: LocationSlug;
   /** Neighbourhood, e.g. "Baneshwor". */
   area: string;
-  address: string | null;
   geo: { lat: number; lng: number } | null;
 }
 
 /**
- * studios/{studioId}. Kept small: unbounded collections (portfolio, gallery,
- * packages, availability) are subcollections. The `startingPrice` and `stats`
- * fields are denormalized so listing/search pages can filter and sort on the
- * studio document alone.
+ * studios/{studioId} — the PUBLIC studio document. Readable by anyone once
+ * published, so it holds only marketplace-facing data. Private data lives in
+ * server-written sub-documents:
+ *   studios/{studioId}/private/contact   phone, email, street address, website,
+ *                                        instagram (owner + admin read)
+ *   studios/{studioId}/private/internal  ownerId, commission, moderation
+ *                                        (admin read)
+ * Unbounded collections (portfolio, gallery, packages, availability) are
+ * subcollections; `startingPrice` and `stats` are denormalized for listings.
  */
 export interface StudioDoc extends Timestamps {
-  ownerId: string;
   businessName: string;
   slug: string;
   description: string;
-  phone: string;
-  email: string | null;
   location: StudioLocation;
-  website: string | null;
-  /** Instagram handle without "@". */
-  instagram: string | null;
   yearsOfExperience: number | null;
   /** Free text: team members / roles. */
   team: string | null;
@@ -99,24 +97,46 @@ export interface StudioDoc extends Timestamps {
   props: string[];
   verificationStatus: StudioVerificationStatus;
   listingStatus: StudioListingStatus;
+  /** Set by the server when an admin publishes the studio. */
+  publishedAt: Timestamp | null;
   /** Lowest active package price, maintained server-side for budget filters. */
   startingPrice: MinorUnits | null;
   currency: Currency;
-  /** Overrides the platform default when negotiated per studio. */
-  commissionRateBps: BasisPoints | null;
   stats: {
     ratingAverage: number;
     reviewCount: number;
     portfolioCount: number;
     completedBookings: number;
   };
-  /** Last admin moderation action (server-only; full history in moderationLog). */
-  lastModeration?: {
+}
+
+/** studios/{studioId}/private/contact — owner + admin readable, server-written. */
+export interface StudioContactDoc {
+  phone: string;
+  email: string | null;
+  /** Street address; the public doc only carries city + area. */
+  address: string | null;
+  website: string | null;
+  /** Instagram handle without "@". */
+  instagram: string | null;
+  updatedAt: Timestamp;
+}
+
+/** studios/{studioId}/private/internal — admin readable, server-written. */
+export interface StudioInternalDoc {
+  /** Authoritative owner for server code (rules use users/{uid}.studioId). */
+  ownerId: string;
+  /** Overrides the platform default when negotiated per studio. */
+  commissionRateBps: BasisPoints | null;
+  /** Last admin moderation action (full history in moderationLog). */
+  lastModeration: {
     action: string;
     by: string;
     at: Timestamp;
     reason: string | null;
-  };
+  } | null;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
 }
 
 /** studios/{studioId}/portfolio/{photoId} */

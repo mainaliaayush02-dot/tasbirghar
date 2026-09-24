@@ -9,6 +9,8 @@ export const siteConfig = {
     "",
   ),
   locale: "en_NP",
+  /** Public support email (optional). Unset → the contact page says so honestly. */
+  contactEmail: process.env.NEXT_PUBLIC_CONTACT_EMAIL?.trim() || null,
   market: "Kathmandu Valley, Nepal",
 } as const;
 

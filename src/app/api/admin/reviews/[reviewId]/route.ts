@@ -13,6 +13,7 @@ import { adminDb } from "@/lib/firebase/admin";
 import { collections } from "@/lib/firestore/paths";
 import { validate } from "@/lib/validation/core";
 import { reviewModerationSchema } from "@/lib/validation/schemas";
+import { invalidateMarketplace } from "@/lib/data/revalidate";
 
 type Context = { params: Promise<{ reviewId: string }> };
 
@@ -46,5 +47,6 @@ export const POST = apiRoute<Context>(async (request, { params }) => {
     });
   });
 
+  invalidateMarketplace();
   return Response.json({ ok: true, status });
 });

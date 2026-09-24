@@ -8,6 +8,7 @@ import { assertStudioOwner, studioRef, studioSub } from "@/lib/data/studios";
 import { adminDb } from "@/lib/firebase/admin";
 import { validate } from "@/lib/validation/core";
 import { LIMITS, mediaConfirmSchema } from "@/lib/validation/schemas";
+import { invalidateMarketplace } from "@/lib/data/revalidate";
 
 /**
  * POST /api/media/confirm { studioId, target, galleryKind?, publicId, alt? }
@@ -65,6 +66,7 @@ export const POST = apiRoute(async (request) => {
         }
         return ref.id;
       });
+      invalidateMarketplace();
       return Response.json({ id, asset }, { status: 201 });
     }
 
@@ -82,6 +84,7 @@ export const POST = apiRoute(async (request) => {
     if (previous && previous.publicId !== asset.publicId && previous.publicId !== other?.publicId) {
       await deleteImageQuietly(previous.publicId);
     }
+    invalidateMarketplace();
     return Response.json({ asset });
   } catch (error) {
     // Anything we failed to record must not linger in Cloudinary — but never

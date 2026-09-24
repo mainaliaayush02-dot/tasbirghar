@@ -33,7 +33,8 @@ export default async function AdminStudioPage({ params }: PageProps<"/admin/stud
   const { studio, owner, application, portfolio, gallery, packages, availability } = data;
   const listing = LISTING_STATUS[studio.listingStatus];
   const verification = VERIFICATION_STATUS[studio.verificationStatus];
-  const rateBps = studio.commissionRateBps ?? DEFAULT_COMMISSION_RATE_BPS;
+  const { contact } = data;
+  const rateBps = data.commissionRateBps ?? DEFAULT_COMMISSION_RATE_BPS;
   const activePackages = packages.filter((p) => p.isActive);
 
   const readiness = [
@@ -87,24 +88,24 @@ export default async function AdminStudioPage({ params }: PageProps<"/admin/stud
             <dl className="mt-6 grid gap-4 sm:grid-cols-2">
               <Detail label="Location">
                 {studio.location.area}, {LOCATIONS.find((l) => l.slug === studio.location.city)?.name}
-                {studio.location.address && <span className="block text-neutral-500">{studio.location.address}</span>}
+                {contact?.address && <span className="block text-neutral-500">{contact.address}</span>}
               </Detail>
               <Detail label="Contact">
-                {studio.phone}
-                {studio.email && <span className="block break-all text-neutral-500">{studio.email}</span>}
+                {contact?.phone ?? "—"}
+                {contact?.email && <span className="block break-all text-neutral-500">{contact.email}</span>}
               </Detail>
               <Detail label="Online">
-                {studio.website ? (
-                  <a href={studio.website} target="_blank" rel="noreferrer noopener nofollow" className="block break-all text-brand-700 hover:underline">
-                    {studio.website}
+                {contact?.website ? (
+                  <a href={contact.website} target="_blank" rel="noreferrer noopener nofollow" className="block break-all text-brand-700 hover:underline">
+                    {contact.website}
                   </a>
                 ) : null}
-                {studio.instagram ? (
-                  <a href={`https://instagram.com/${studio.instagram}`} target="_blank" rel="noreferrer noopener" className="block text-brand-700 hover:underline">
-                    @{studio.instagram}
+                {contact?.instagram ? (
+                  <a href={`https://instagram.com/${contact.instagram}`} target="_blank" rel="noreferrer noopener" className="block text-brand-700 hover:underline">
+                    @{contact.instagram}
                   </a>
                 ) : null}
-                {!studio.website && !studio.instagram && "—"}
+                {!contact?.website && !contact?.instagram && "—"}
               </Detail>
               <Detail label="Experience">{studio.yearsOfExperience !== null && studio.yearsOfExperience !== undefined ? `${studio.yearsOfExperience} years` : "—"}</Detail>
               <Detail label="Categories">
@@ -220,7 +221,7 @@ export default async function AdminStudioPage({ params }: PageProps<"/admin/stud
               <Detail label="Listing"><StatusPill tone={listing.tone}>{listing.label}</StatusPill></Detail>
               <Detail label="Verification"><StatusPill tone={verification.tone}>{verification.label}</StatusPill></Detail>
               <Detail label="Commission rate">
-                {rateBps / 100}% ({rateBps} bps){studio.commissionRateBps === null ? " · platform default" : ""}
+                {rateBps / 100}% ({rateBps} bps){data.commissionRateBps === null ? " · platform default" : ""}
               </Detail>
               <Detail label="Bookings">{data.bookingCount}</Detail>
               {data.lastModeration && (
