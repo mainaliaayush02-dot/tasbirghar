@@ -16,6 +16,8 @@ export const studioSubcollections = {
   gallery: "gallery",
   packages: "packages",
   availability: "availability",
+  /** Server-only audit trail of admin moderation actions. */
+  moderationLog: "moderationLog",
 } as const;
 
 export type StudioSubcollection =

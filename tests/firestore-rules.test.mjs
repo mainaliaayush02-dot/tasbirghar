@@ -737,3 +737,29 @@ describe("photographerApplications are server-only", () => {
   });
 });
 
+/* -------------------------------------------- admin moderation fields (P2.1) */
+
+describe("moderation state is server-only", () => {
+  const entry = { action: "publish", by: "pa", at: "2026-09-24", reason: null };
+
+  test("owner cannot write lastModeration or the moderation log", async () => {
+    await assertFails(updateDoc(ref(photographer(), "studios/studioA"), { lastModeration: entry }));
+    await assertFails(setDoc(ref(photographer(), "studios/studioA/moderationLog/x"), entry));
+    await assertFails(getDocs(collection(photographer(), "studios/studioA/moderationLog")));
+  });
+  test("admin cannot write moderation state via the client SDK either", async () => {
+    await assertFails(updateDoc(ref(admin(), "studios/studioA"), { lastModeration: entry, listingStatus: "published" }));
+    await assertFails(setDoc(ref(admin(), "studios/studioA/moderationLog/x"), entry));
+  });
+  test("nobody can read the moderation log from the client", async () => {
+    await env.withSecurityRulesDisabled((ctx) => setDoc(doc(ctx.firestore(), "studios/studioA/moderationLog/l1"), entry));
+    await assertFails(getDoc(ref(anon(), "studios/studioA/moderationLog/l1")));
+    await assertFails(getDoc(ref(photographer(), "studios/studioA/moderationLog/l1")));
+    await assertFails(getDoc(ref(customer(), "studios/studioA/moderationLog/l1")));
+  });
+  test("review moderation cannot be done from the client", async () => {
+    await assertFails(updateDoc(ref(admin(), "reviews/b1"), { status: "hidden", moderation: entry }));
+    await assertFails(updateDoc(ref(customer(), "reviews/b1"), { status: "hidden" }));
+  });
+});
+

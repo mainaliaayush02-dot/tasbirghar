@@ -43,6 +43,9 @@ export interface ApplicationDTO {
   status: ApplicationStatus;
   submittedAt: string | null;
   reviewedAt: string | null;
+  reviewedBy: string | null;
+  approvedAt: string | null;
+  approvedBy: string | null;
   rejectionReason: string | null;
 }
 

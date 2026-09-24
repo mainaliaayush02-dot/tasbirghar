@@ -1,7 +1,8 @@
 import { apiRoute, ApiError, readJson, validated } from "@/lib/api/http";
 import { homeForRole } from "@/lib/auth/current-user";
 import { roleFromClaims } from "@/lib/auth/roles";
-import { clearSession, createSession, SessionError } from "@/lib/auth/session";
+import { clearSession, createSession, readSession, SessionError } from "@/lib/auth/session";
+import { adminAuth } from "@/lib/firebase/admin";
 import { ensureUserDoc } from "@/lib/data/users";
 import { validate } from "@/lib/validation/core";
 import { signupProfileSchema } from "@/lib/validation/schemas";
@@ -48,8 +49,15 @@ export const POST = apiRoute(async (request) => {
   return Response.json({ role, redirectTo: homeForRole(role) });
 });
 
-/** DELETE /api/auth/session — sign out (clears the cookie). */
+/**
+ * DELETE /api/auth/session — sign out. Clears the cookie AND revokes the
+ * user's refresh tokens, so a copied session cookie stops working server-side
+ * too (session cookies cannot be revoked individually; this signs the user
+ * out on every device).
+ */
 export const DELETE = apiRoute(async () => {
+  const session = await readSession();
   await clearSession();
+  if (session) await adminAuth().revokeRefreshTokens(session.uid);
   return Response.json({ ok: true });
 });

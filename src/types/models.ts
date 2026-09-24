@@ -110,6 +110,13 @@ export interface StudioDoc extends Timestamps {
     portfolioCount: number;
     completedBookings: number;
   };
+  /** Last admin moderation action (server-only; full history in moderationLog). */
+  lastModeration?: {
+    action: string;
+    by: string;
+    at: Timestamp;
+    reason: string | null;
+  };
 }
 
 /** studios/{studioId}/portfolio/{photoId} */

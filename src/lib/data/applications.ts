@@ -12,7 +12,7 @@ import { toIso } from "./serialize";
 export const applicationRef = (uid: string) =>
   adminDb().collection(collections.photographerApplications).doc(uid);
 
-function toDTO(snap: DocumentSnapshot): ApplicationDTO {
+export function toApplicationDTO(snap: DocumentSnapshot): ApplicationDTO {
   const d = snap.data() as PhotographerApplicationDoc;
   return {
     applicantUid: d.applicantUid,
@@ -31,13 +31,16 @@ function toDTO(snap: DocumentSnapshot): ApplicationDTO {
     status: d.status,
     submittedAt: toIso(d.submittedAt),
     reviewedAt: toIso(d.reviewedAt),
+    reviewedBy: d.reviewedBy ?? null,
+    approvedAt: toIso(d.approvedAt),
+    approvedBy: d.approvedBy ?? null,
     rejectionReason: d.rejectionReason,
   };
 }
 
 export async function getApplication(uid: string): Promise<ApplicationDTO | null> {
   const snap = await applicationRef(uid).get();
-  return snap.exists ? toDTO(snap) : null;
+  return snap.exists ? toApplicationDTO(snap) : null;
 }
 
 /** Admin only — callers must have verified the admin claim. */
@@ -48,7 +51,7 @@ export async function listApplications(status: ApplicationStatus, limit = 50) {
     .limit(limit)
     .get();
   return snap.docs
-    .map(toDTO)
+    .map(toApplicationDTO)
     .sort((a, b) => (a.submittedAt ?? "").localeCompare(b.submittedAt ?? ""));
 }
 

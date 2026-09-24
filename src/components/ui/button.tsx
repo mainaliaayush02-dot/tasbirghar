@@ -1,7 +1,7 @@
 import Link from "next/link";
 import type { ComponentProps } from "react";
 
-type Variant = "primary" | "secondary" | "ghost" | "danger";
+type Variant = "primary" | "secondary" | "ghost" | "danger" | "dangerSolid";
 type Size = "sm" | "md";
 
 const base =
@@ -12,6 +12,7 @@ const variants: Record<Variant, string> = {
   secondary: "border border-neutral-300 bg-white text-neutral-800 hover:bg-neutral-50",
   ghost: "text-neutral-700 hover:bg-neutral-100",
   danger: "border border-red-200 bg-white text-red-700 hover:bg-red-50",
+  dangerSolid: "bg-red-600 text-white hover:bg-red-700",
 };
 
 const sizes: Record<Size, string> = {

@@ -241,10 +241,12 @@ To remove admin, run `npm run admin:grant -- --email you@example.com --revoke --
 
 | Route | Who | Purpose |
 | --- | --- | --- |
-| `POST/DELETE /api/auth/session` | anyone with a fresh ID token / signed-in user | create or clear the session; first-login `users/{uid}` |
+| `POST/DELETE /api/auth/session` | anyone with a fresh ID token / signed-in user | create the session (first login also creates `users/{uid}`); logout clears the cookie **and revokes the user's refresh tokens**, so a copied cookie also stops working (signs out every device) |
 | `PATCH /api/account` | signed-in user | `displayName`, `phone` only |
 | `POST /api/photographer-applications` | customer | submit an application |
 | `POST /api/admin/applications/{uid}` | admin | approve or reject |
+| `POST /api/admin/studios/{id}` | admin | moderation: `publish`, `unpublish`, `suspend` (reason required), `reinstate`, `verify`, `unverify` |
+| `POST /api/admin/reviews/{id}` | admin | review visibility: `publish` / `hide` (reason required); text and rating are never editable |
 | `POST /api/studios` | photographer | create own studio |
 | `PUT /api/studios/{id}` | owner | update studio profile |
 | `POST /api/media/sign` / `POST /api/media/confirm` | owner | signed direct upload; confirm writes the media record (portfolio, gallery, profile, cover) |
@@ -252,6 +254,19 @@ To remove admin, run `npm run admin:grant -- --email you@example.com --revoke --
 | `POST /api/studios/{id}/packages`, `PUT/DELETE …/packages/{packageId}` | owner | packages (rupees in, integer paisa stored); keeps `startingPrice` in sync |
 
 Ownership is checked with `assertStudioOwner(studioId, sessionUid)`. Admins are **not** owners, so moderation will get its own routes.
+
+### Owner console (`/admin`, Phase 2.1)
+
+The owner is an ordinary Firebase Auth account that has been given the `admin` claim with `npm run admin:grant`. The console:
+
+- **Screens:** dashboard KPIs and marketplace overview; applications; studios (filters, search, detail with portfolio, gallery, packages, availability and moderation); photographers; customers (masked phones); bookings; reviews; commission; read-only settings.
+- **Authorization:** the `(admin)` layout calls `requireUser("admin")` before anything streams, so non-admins get a real 404. Every page and route re-checks the live claim.
+- **Reads:** all through the Admin SDK in Server Components (`src/lib/data/admin.ts`). Counts and money totals use Firestore `count()` and `sum()` aggregations. List pages scan at most 500 recent documents and filter or search in memory, 20 per page. Replace this with a search index once collections grow.
+- **Writes:** only the server routes above. Every moderation action writes `lastModeration` plus an append-only `studios/{id}/moderationLog` entry (who, when, why, from → to). Clients can neither read nor write either one, which the rules tests cover.
+- **Publishing guard:** a studio needs a profile photo, at least one portfolio photo and one active package before it can be published.
+- **Recent activity** is derived from existing timestamps (applications, users, studios, bookings), since there is no event log yet. It is labelled as such, and nothing is invented.
+- **Missing records** (for example `/admin/studios/<unknown>`) render a not-found screen with a **200 status** and `noindex`. The pages stream behind `loading.tsx`, and Next.js commits the status before `notFound()` runs; see the Next docs, `loading.md` → Status Codes. The role check is unaffected.
+- **Destructive actions** (reject, suspend, unpublish, hide) go through an accessible native `<dialog>` confirmation, and some require a reason.
 
 ### Validation
 
@@ -271,7 +286,7 @@ Ownership is checked with `assertStudioOwner(studioId, sessionUid)`. Admins are 
 | `(auth)` | `/login`, `/signup` (noindex) |
 | `(customer)` | `/account`, `/become-a-photographer` |
 | `(studio)` | `/dashboard`, `/dashboard/studio`, `/portfolio`, `/gallery`, `/packages`, `/availability` (placeholder), `/verification` |
-| `(admin)` | `/admin`, `/admin/applications` |
+| `(admin)` | `/admin`, `/admin/applications[/uid]`, `/admin/studios[/id]`, `/admin/photographers`, `/admin/customers`, `/admin/bookings`, `/admin/reviews`, `/admin/commission`, `/admin/settings` |
 
 ---
 

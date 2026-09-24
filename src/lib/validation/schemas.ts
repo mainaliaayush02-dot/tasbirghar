@@ -244,3 +244,38 @@ export const packageSchema: Schema<PackageInput> = {
   isActive: bool(),
   sortOrder: int({ min: 0, max: 10_000 }),
 };
+
+/* ------------------------------------------------------------ moderation */
+
+export const STUDIO_MODERATION_ACTIONS = [
+  "publish",
+  "unpublish",
+  "suspend",
+  "reinstate",
+  "verify",
+  "unverify",
+] as const;
+export type StudioModerationAction = (typeof STUDIO_MODERATION_ACTIONS)[number];
+
+export interface StudioModerationInput {
+  action: StudioModerationAction;
+  reason: string | null;
+}
+
+export const studioModerationSchema: Schema<StudioModerationInput> = {
+  action: oneOf(STUDIO_MODERATION_ACTIONS, "Unknown action."),
+  reason: optionalText({ max: 500, multiline: true }),
+};
+
+export const REVIEW_MODERATION_ACTIONS = ["publish", "hide"] as const;
+
+export interface ReviewModerationInput {
+  action: (typeof REVIEW_MODERATION_ACTIONS)[number];
+  reason: string | null;
+}
+
+export const reviewModerationSchema: Schema<ReviewModerationInput> = {
+  action: oneOf(REVIEW_MODERATION_ACTIONS, "Unknown action."),
+  reason: optionalText({ max: 500, multiline: true }),
+};
+

@@ -12,14 +12,16 @@
   --font-mono: var(--font-geist-mono);
 }
 
-/* TasbirGhar brand: warm terracotta accent. */
+/* TasbirGhar brand — sampled from the logo: burnt orange, charcoal, warm cream. */
 @theme {
-  --color-brand-50: #fdf4f1;
-  --color-brand-100: #fbe6de;
-  --color-brand-200: #f5c9b8;
-  --color-brand-500: #d0633e;
-  --color-brand-600: #b8502d;
-  --color-brand-700: #963f24;
+  --color-brand-50: #fbf4ec;
+  --color-brand-100: #f5e4d2;
+  --color-brand-200: #e9c7a6;
+  --color-brand-500: #c2733c;
+  --color-brand-600: #ac5d2a;
+  --color-brand-700: #8a4920;
+  --color-ink: #2b2623;
+  --color-cream: #fbf7f1;
 }
 
 body {

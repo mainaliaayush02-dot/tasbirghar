@@ -555,12 +555,182 @@ describe("packages", () => {
   });
 });
 
-/* ============================================================== 7. logout */
+/* ======================================================= 7. admin console */
+
+const ADMIN_PAGES = [
+  "/admin",
+  "/admin/applications",
+  "/admin/applications?status=all",
+  "/admin/studios",
+  "/admin/studios?status=draft&q=alice",
+  "/admin/photographers",
+  "/admin/customers",
+  "/admin/bookings",
+  "/admin/reviews",
+  "/admin/commission",
+  "/admin/settings",
+];
+
+describe("admin console", () => {
+  test("every admin page renders for the admin", async () => {
+    for (const path of [...ADMIN_PAGES, `/admin/studios/${S.studioA}`, `/admin/applications/${S.alice.uid}`]) {
+      const res = await call(S.admin, "GET", path);
+      assert.equal(res.status, 200, path);
+    }
+  });
+
+  test("admin pages are hidden (404) from customers and photographers", async () => {
+    for (const user of [S.carol, S.alice]) {
+      for (const path of [...ADMIN_PAGES, `/admin/studios/${S.studioA}`]) {
+        assert.equal((await call(user, "GET", path)).status, 404, path);
+      }
+    }
+    const anon = await call(null, "GET", "/admin/studios");
+    assert.equal(anon.status, 307);
+  });
+
+  test("unknown studio / application ids render the not-found screen (noindex)", async () => {
+    // Admin pages stream behind a loading skeleton, so Next.js commits a 200
+    // before notFound() runs ("soft 404", documented in loading.md → Status
+    // Codes). The role check runs in the layout BEFORE streaming, which is why
+    // non-admins get a real 404 above.
+    for (const path of ["/admin/studios/does-not-exist", "/admin/applications/does-not-exist"]) {
+      const res = await fetch(`${BASE}${path}`, { headers: { Cookie: S.admin.cookie } });
+      const html = await res.text();
+      assert.match(html, /couldn(&#x27;|')t find that record/, path);
+      assert.match(html, /<meta name="robots" content="noindex/, path);
+      assert.doesNotMatch(html, /Marketplace status|Portfolio introduction/, path);
+    }
+  });
+});
+
+describe("studio moderation (server route, admin claim)", () => {
+  const moderate = (user, studioId, body) => call(user, "POST", `/api/admin/studios/${studioId}`, body);
+
+  test("owners, customers and anonymous users cannot moderate", async () => {
+    assert.equal((await moderate(S.alice, S.studioA, { action: "publish", reason: null })).status, 403);
+    assert.equal((await moderate(S.alice, S.studioA, { action: "verify", reason: null })).status, 403);
+    assert.equal((await moderate(S.carol, S.studioA, { action: "publish", reason: null })).status, 403);
+    assert.equal((await moderate(null, S.studioA, { action: "publish", reason: null })).status, 401);
+    assert.equal((await db.doc(`studios/${S.studioA}`).get()).get("listingStatus"), "draft");
+  });
+
+  test("input is validated; unknown actions and smuggled fields are rejected", async () => {
+    assert.equal((await moderate(S.admin, S.studioA, { action: "delete", reason: null })).status, 422);
+    assert.equal((await moderate(S.admin, S.studioA, { action: "publish", reason: null, listingStatus: "published" })).status, 422);
+    assert.equal((await moderate(S.admin, S.studioA, { action: "publish", reason: null, commissionRateBps: 0 })).status, 422);
+    assert.equal((await moderate(S.admin, "a%2Fb", { action: "publish", reason: null })).status, 404);
+  });
+
+  test("an incomplete studio cannot be published", async () => {
+    const res = await moderate(S.admin, S.studioB, { action: "publish", reason: null });
+    assert.equal(res.status, 409);
+    assert.equal(res.json.error.code, "INCOMPLETE_LISTING");
+  });
+
+  test("admin publishes a complete studio; audit trail recorded", async () => {
+    // Studio A has a profile image; add a portfolio photo and an active package.
+    const pid = await upload(S.alice, S.studioA, "portfolio");
+    assert.equal((await confirm(S.alice, S.studioA, "portfolio", pid)).status, 201);
+    assert.equal((await call(S.alice, "POST", `/api/studios/${S.studioA}/packages`, pkg())).status, 201);
+
+    const res = await moderate(S.admin, S.studioA, { action: "publish", reason: null });
+    assert.equal(res.status, 200, JSON.stringify(res.json));
+    const doc = (await db.doc(`studios/${S.studioA}`).get()).data();
+    assert.equal(doc.listingStatus, "published");
+    assert.equal(doc.lastModeration.action, "publish");
+    assert.equal(doc.lastModeration.by, S.admin.uid);
+    assert.equal(doc.commissionRateBps, 800, "moderation never touches commission");
+    const log = await db.collection(`studios/${S.studioA}/moderationLog`).get();
+    assert.equal(log.size, 1);
+    assert.equal(log.docs[0].get("to.listingStatus"), "published");
+    // Invalid transition.
+    assert.equal((await moderate(S.admin, S.studioA, { action: "publish", reason: null })).status, 409);
+  });
+
+  test("suspend requires a reason; reinstate returns to draft; verify toggles", async () => {
+    assert.equal((await moderate(S.admin, S.studioA, { action: "suspend", reason: null })).status, 422);
+    assert.equal((await moderate(S.admin, S.studioA, { action: "suspend", reason: "Customer complaint under review" })).status, 200);
+    assert.equal((await db.doc(`studios/${S.studioA}`).get()).get("listingStatus"), "suspended");
+    // Owner cannot lift a suspension.
+    assert.equal((await moderate(S.alice, S.studioA, { action: "reinstate", reason: null })).status, 403);
+    assert.equal((await moderate(S.admin, S.studioA, { action: "reinstate", reason: null })).status, 200);
+    assert.equal((await db.doc(`studios/${S.studioA}`).get()).get("listingStatus"), "draft");
+    assert.equal((await moderate(S.admin, S.studioA, { action: "verify", reason: null })).status, 200);
+    assert.equal((await db.doc(`studios/${S.studioA}`).get()).get("verificationStatus"), "verified");
+    assert.equal((await moderate(S.admin, S.studioA, { action: "verify", reason: null })).status, 409);
+    assert.equal((await db.collection(`studios/${S.studioA}/moderationLog`).get()).size, 4);
+  });
+
+  test("owner profile edits cannot touch moderation state", async () => {
+    const res = await call(S.alice, "PUT", `/api/studios/${S.studioA}`, { ...profileOf(studio("x")), lastModeration: null });
+    assert.equal(res.status, 422);
+    const ok = await call(S.alice, "PUT", `/api/studios/${S.studioA}`, profileOf(studio("x")));
+    assert.equal(ok.status, 200);
+    const doc = (await db.doc(`studios/${S.studioA}`).get()).data();
+    assert.equal(doc.verificationStatus, "verified");
+    assert.equal(doc.lastModeration.action, "verify");
+  });
+});
+
+describe("review moderation (server route, admin claim)", () => {
+  const reviewId = `rv-${RUN}`;
+
+  before(async () => {
+    await db.doc(`reviews/${reviewId}`).set({
+      bookingId: reviewId,
+      studioId: S.studioA,
+      customerId: S.carol.uid,
+      customerDisplayName: "Carol",
+      rating: 5,
+      comment: "Lovely newborn session.",
+      status: "published",
+      studioReply: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+  });
+  after(() => db.doc(`reviews/${reviewId}`).delete());
+
+  test("only admins can moderate; hiding needs a reason", async () => {
+    const path = `/api/admin/reviews/${reviewId}`;
+    assert.equal((await call(S.alice, "POST", path, { action: "hide", reason: "x" })).status, 403);
+    assert.equal((await call(S.carol, "POST", path, { action: "hide", reason: "x" })).status, 403);
+    assert.equal((await call(S.admin, "POST", path, { action: "hide", reason: null })).status, 422);
+    assert.equal((await call(S.admin, "POST", path, { action: "hide", reason: "Contains personal data" })).status, 200);
+    const doc = (await db.doc(`reviews/${reviewId}`).get()).data();
+    assert.equal(doc.status, "hidden");
+    assert.equal(doc.moderation.by, S.admin.uid);
+    assert.equal(doc.comment, "Lovely newborn session.", "text is never edited");
+    assert.equal((await call(S.admin, "POST", path, { action: "hide", reason: "again" })).status, 409);
+    assert.equal((await call(S.admin, "POST", path, { action: "publish", reason: null, rating: 1 })).status, 422);
+    assert.equal((await call(S.admin, "POST", path, { action: "publish", reason: null })).status, 200);
+    assert.equal((await call(S.admin, "POST", "/api/admin/reviews/nope", { action: "hide", reason: "x" })).status, 404);
+  });
+
+  test("the reviews admin page lists the review", async () => {
+    assert.equal((await call(S.admin, "GET", "/admin/reviews")).status, 200);
+  });
+});
+
+/* ============================================================== 8. logout */
 
 describe("logout", () => {
   test("DELETE /api/auth/session clears the cookie", async () => {
     const res = await fetch(`${BASE}/api/auth/session`, { method: "DELETE", headers: { Origin: BASE, Cookie: S.alice.cookie } });
     assert.equal(res.status, 200);
     assert.match(res.headers.get("set-cookie") ?? "", /__session=;|Max-Age=0|Expires=Thu, 01 Jan 1970/i);
+  });
+
+  test("after admin logout, the old session cookie no longer opens /admin (server-side revocation)", async () => {
+    assert.equal((await call(S.admin, "GET", "/admin")).status, 200);
+    // Revocation has 1-second granularity relative to sign-in time.
+    await new Promise((r) => setTimeout(r, 1100));
+    const res = await fetch(`${BASE}/api/auth/session`, { method: "DELETE", headers: { Origin: BASE, Cookie: S.admin.cookie } });
+    assert.equal(res.status, 200);
+    const replay = await call(S.admin, "GET", "/admin");
+    assert.equal(replay.status, 307);
+    assert.match(replay.location ?? "", /\/login/);
+    assert.equal((await call(S.admin, "POST", `/api/admin/studios/${S.studioA}`, { action: "unverify", reason: null })).status, 401);
   });
 });
