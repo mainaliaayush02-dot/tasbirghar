@@ -36,9 +36,12 @@ export function DayEditor({ studioId, day, packageDurations }: { studioId: strin
   const [slots, setSlots] = useState<Window[]>(day.mode === "custom" ? day.slots : []);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ tone: "success" | "danger"; text: string } | null>(null);
+  // What is saved on the server. Updated immediately on a successful save, so
+  // "unsaved changes" stays correct while router.refresh() is still loading.
+  const [saved, setSaved] = useState<{ mode: Mode; slots: Window[] }>({ mode: day.mode, slots: day.mode === "custom" ? day.slots : [] });
 
   const localError = mode === "custom" ? slotsError(slots) : null;
-  const dirty = mode !== day.mode || (mode === "custom" && JSON.stringify(slots) !== JSON.stringify(day.slots));
+  const dirty = mode !== saved.mode || (mode === "custom" && JSON.stringify(slots) !== JSON.stringify(saved.slots));
   const longest = packageDurations.length ? Math.max(...packageDurations) : 0;
   const tooShort = mode === "custom" && longest > 0 && slots.length > 0 && slots.every((s) => toMinutes(s.end) - toMinutes(s.start) < Math.min(...packageDurations));
 
@@ -69,6 +72,7 @@ export function DayEditor({ studioId, day, packageDurations }: { studioId: strin
       setMessage({ tone: "danger", text: result.message });
       return;
     }
+    setSaved({ mode, slots: mode === "custom" ? slots : [] });
     setMessage({ tone: "success", text: "Availability saved." });
     router.refresh();
   }

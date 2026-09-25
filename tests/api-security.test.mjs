@@ -740,19 +740,24 @@ describe("review moderation (server route, admin claim)", () => {
       customerDisplayName: "Carol",
       rating: 5,
       comment: "Lovely newborn session.",
-      status: "published",
+      status: "pending_moderation",
       studioReply: null,
       createdAt: new Date(),
       updatedAt: new Date(),
     });
   });
-  after(() => db.doc(`reviews/${reviewId}`).delete());
+  // Hide first (so the studio's rating totals are restored), then remove the fixture.
+  after(async () => {
+    await call(S.admin, "POST", `/api/admin/reviews/${reviewId}`, { action: "hide", reason: "test cleanup" });
+    await db.doc(`reviews/${reviewId}`).delete();
+  });
 
   test("only admins can moderate; hiding needs a reason", async () => {
     const path = `/api/admin/reviews/${reviewId}`;
     assert.equal((await call(S.alice, "POST", path, { action: "hide", reason: "x" })).status, 403);
     assert.equal((await call(S.carol, "POST", path, { action: "hide", reason: "x" })).status, 403);
     assert.equal((await call(S.admin, "POST", path, { action: "hide", reason: null })).status, 422);
+    assert.equal((await call(S.admin, "POST", path, { action: "publish", reason: null })).status, 200);
     assert.equal((await call(S.admin, "POST", path, { action: "hide", reason: "Contains personal data" })).status, 200);
     const doc = (await db.doc(`reviews/${reviewId}`).get()).data();
     assert.equal(doc.status, "hidden");
@@ -1505,6 +1510,220 @@ describe("Phase 4B-1: booking lifecycle hardening", () => {
 
     // Admin sees the derived label (read-only).
     assert.match((await page("/admin/bookings", S.admin2 ?? S.admin)).html, />Expired</);
+  });
+});
+
+/* ============================================= 8d. Phase 4B-2: reviews and ratings */
+
+describe("Phase 4B-2: reviews and rating accounting", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const submit = (user, bookingId, body) => call(user, "POST", `/api/bookings/${bookingId}/review`, body);
+  const moderate = (bookingId, action, reason = action === "hide" ? "Not appropriate" : null) =>
+    call(S.admin, "POST", `/api/admin/reviews/${bookingId}`, { action, reason });
+  const good = (rating = 5) => ({ rating, comment: "Warm, patient team and beautiful newborn photos. Highly recommended!" });
+  const stats = async () => {
+    const s = (await db.doc(`studios/${S.studioA}`).get()).get("stats");
+    return { ratingSum: s.ratingSum ?? 0, reviewCount: s.reviewCount, ratingAverage: s.ratingAverage };
+  };
+  const expectStats = async (base, sum, count, label) => {
+    const want = { ratingSum: base.ratingSum + sum, reviewCount: base.reviewCount + count };
+    const got = await stats();
+    assert.equal(got.ratingSum, want.ratingSum, `${label}: ratingSum`);
+    assert.equal(got.reviewCount, want.reviewCount, `${label}: reviewCount`);
+    assert.equal(got.ratingAverage, want.reviewCount ? Math.round((want.ratingSum / want.reviewCount) * 100) / 100 : 0, `${label}: ratingAverage`);
+  };
+  /** Admin-SDK fixture: a booking in a state the public API reaches only over time (completed, old, etc.). */
+  const seed = async (customer, fields) => {
+    const ref = db.collection("bookings").doc();
+    await ref.set({
+      customerId: customer.uid, studioId: S.studioA, studioOwnerId: S.alice.uid, packageId: S.pkgA, photographyCategory: "newborn",
+      shootDate: plusDays(-5), startTime: "10:00", endTime: "12:00", timezone: "Asia/Kathmandu", customerName: "Seeded Customer",
+      customerPhone: "+9779811111155", customerNote: null, packageSnapshot: { name: "Seeded", price: 1500000, durationMinutes: 120 },
+      studioSnapshot: { businessName: "Seeded", slug: "seeded" }, paymentStatus: "unpaid", payoutStatus: "pending", currency: "NPR",
+      grossAmount: 1500000, commissionRateBps: 800, commissionAmount: 120000, photographerNetAmount: 1380000,
+      bookingStatus: "completed", confirmedAt: new Date(Date.now() - 10 * DAY), completedAt: new Date(Date.now() - DAY),
+      cancelledAt: null, reviewedAt: null, createdAt: new Date(), updatedAt: new Date(), ...fields,
+    });
+    return ref.id;
+  };
+  const B = {};
+
+  before(async () => {
+    [S.nora, S.omar, S.pia, S.quin] = await Promise.all(
+      [["nora", "Nora Gurung"], ["omar", "Omar Karki"], ["pia", "Pia Thapa"], ["quin", "Quin Rai"]].map(([n, name]) =>
+        login(`${n}-${RUN}@example.com`, { signup: true, profile: { displayName: name, phone: "98" + String(10000000 + n.length * 1111111).slice(0, 8) } }),
+      ),
+    );
+    B.done = await seed(S.nora);
+    B.race = await seed(S.nora, { completedAt: new Date(Date.now() - 2 * DAY) });
+    B.omar = await seed(S.omar);
+    B.old = await seed(S.pia, { completedAt: new Date(Date.now() - 61 * DAY) });
+    B.edge = await seed(S.pia, { completedAt: new Date(Date.now() - 59 * DAY) });
+    B.quin = await seed(S.quin);
+    B.pending = await seed(S.nora, { bookingStatus: "pending", shootDate: plusDays(100), completedAt: null, confirmedAt: null });
+    B.confirmed = await seed(S.nora, { bookingStatus: "confirmed", shootDate: plusDays(100), completedAt: null });
+    B.cancelled = await seed(S.nora, { bookingStatus: "cancelled_by_customer", completedAt: null, cancelledAt: new Date() });
+    B.studioCancelled = await seed(S.nora, { bookingStatus: "cancelled_by_studio", completedAt: null, cancelledAt: new Date() });
+    B.declined = await seed(S.nora, { bookingStatus: "declined", completedAt: null, cancelledAt: new Date() });
+    B.expired = await seed(S.nora, { bookingStatus: "pending", shootDate: plusDays(-2), completedAt: null, confirmedAt: null });
+    S.statsBase = await stats();
+  });
+
+  test("only completed bookings within 60 days can be reviewed", async () => {
+    for (const key of ["pending", "confirmed", "cancelled", "studioCancelled", "declined", "expired"]) {
+      const res = await submit(S.nora, B[key], good());
+      assert.equal(res.status, 409, key);
+      assert.equal(res.json.error.code, "NOT_COMPLETED", key);
+    }
+    const old = await submit(S.pia, B.old, good());
+    assert.equal(old.status, 409);
+    assert.equal(old.json.error.code, "REVIEW_WINDOW_CLOSED");
+    assert.equal((await submit(S.pia, B.edge, good(4))).status, 201, "day 59 is still open");
+    for (const key of ["pending", "old"]) assert.equal((await db.doc(`reviews/${B[key]}`).get()).exists, false, `no review for ${key}`);
+  });
+
+  test("only the booking's own customer can review it", async () => {
+    assert.equal((await submit(null, B.done, good())).status, 401, "signed out");
+    assert.equal((await submit(S.omar, B.done, good())).status, 404, "another customer");
+    assert.equal((await submit(S.alice, B.done, good())).status, 403, "studio owner (photographer)");
+    assert.equal((await submit(S.bob, B.done, good())).status, 403, "other photographer");
+    assert.equal((await submit(S.admin, B.done, good())).status, 403, "admin");
+    assert.equal((await submit(S.nora, "does-not-exist", good())).status, 404);
+    assert.equal((await submit(S.nora, "a%2Fb", good())).status, 404);
+    assert.equal((await db.doc(`reviews/${B.done}`).get()).exists, false);
+  });
+
+  test("rating, comment and body shape are validated server-side", async () => {
+    for (const rating of [0, 6, 3.5, "5", null, -1, true]) {
+      assert.equal((await submit(S.nora, B.done, { ...good(), rating })).status, 422, `rating ${JSON.stringify(rating)}`);
+    }
+    for (const comment of ["Too short, 19 chars", "x".repeat(1001), "", "                    short                    ", null, 42]) {
+      assert.equal((await submit(S.nora, B.done, { ...good(), comment })).status, 422, `comment length ${String(comment).length}`);
+    }
+    assert.equal((await submit(S.nora, B.done, { rating: 5 })).status, 422, "missing comment");
+    for (const extra of [
+      { studioId: S.studioB }, { customerId: S.omar.uid }, { bookingId: B.omar }, { customerDisplayName: "Real Name" },
+      { status: "published" }, { createdAt: "2020-01-01" }, { ratingSum: 999 }, { moderation: null }, { studioReply: "hi" },
+    ]) {
+      assert.equal((await submit(S.nora, B.done, { ...good(), ...extra })).status, 422, JSON.stringify(extra));
+    }
+    assert.equal((await db.doc(`reviews/${B.done}`).get()).exists, false, "nothing was created");
+  });
+
+  test("a valid review is created server-side as pending moderation, with a privacy-safe name", async () => {
+    const res = await submit(S.nora, B.done, good(5));
+    assert.equal(res.status, 201, JSON.stringify(res.json));
+    assert.equal(res.json.status, "pending_moderation");
+    const r = (await db.doc(`reviews/${B.done}`).get()).data();
+    assert.equal(r.bookingId, B.done);
+    assert.equal(r.studioId, S.studioA, "studio from the booking");
+    assert.equal(r.customerId, S.nora.uid);
+    assert.equal(r.customerDisplayName, "Nora G.");
+    assert.equal(r.status, "pending_moderation");
+    assert.equal(r.rating, 5);
+    assert.equal(r.studioReply, null);
+    assert.ok(!JSON.stringify(r).includes("9811111155"), "no phone in the review");
+    assert.ok((await db.doc(`bookings/${B.done}`).get()).get("reviewedAt"), "booking.reviewedAt set");
+    await expectStats(S.statsBase, 0, 0, "pending reviews don't count");
+    const page = await call(null, "GET", `/photographers/${S.slugA}`);
+    assert.ok(!(await fetch(`${BASE}/photographers/${S.slugA}`).then((x) => x.text())).includes("Warm, patient team"), "not public before moderation");
+    assert.equal(page.status, 200);
+  });
+
+  test("duplicates are refused and reviews can't be edited or deleted", async () => {
+    const again = await submit(S.nora, B.done, good(1));
+    assert.equal(again.status, 409);
+    assert.equal(again.json.error.code, "ALREADY_REVIEWED");
+    assert.equal((await db.doc(`reviews/${B.done}`).get()).get("rating"), 5, "original kept");
+    for (const method of ["PUT", "PATCH", "DELETE", "GET"]) {
+      assert.equal((await call(S.nora, method, `/api/bookings/${B.done}/review`, method === "GET" || method === "DELETE" ? undefined : good(1))).status, 405, method);
+    }
+  });
+
+  test("simultaneous submissions for one booking create exactly one review", async () => {
+    const results = await Promise.all(Array.from({ length: 6 }, (_, i) => submit(S.nora, B.race, good(1 + (i % 5)))));
+    const statuses = results.map((r) => r.status).sort();
+    assert.deepEqual(statuses, [201, 409, 409, 409, 409, 409], JSON.stringify(results.map((r) => r.json)));
+    const snap = await db.collection("reviews").where("customerId", "==", S.nora.uid).get();
+    assert.equal(snap.docs.filter((d) => d.id === B.race).length, 1);
+  });
+
+  test("moderation keeps published-only rating totals exact through repeated changes", async () => {
+    const base = S.statsBase;
+    assert.equal((await submit(S.omar, B.omar, { rating: 2, comment: "OMAR-HIDDEN-MARKER: the lighting was not what we expected." })).status, 201);
+    // B.done = 5★ (Nora), B.omar = 2★ (Omar), B.edge = 4★ (Pia), all pending.
+    assert.equal((await moderate(B.done, "publish")).status, 200);
+    await expectStats(base, 5, 1, "publish 5★");
+    const repeat = await moderate(B.done, "publish");
+    assert.equal(repeat.status, 409);
+    assert.equal(repeat.json.error.code, "NO_CHANGE");
+    await expectStats(base, 5, 1, "repeat publish is a no-op");
+    assert.equal((await moderate(B.omar, "publish")).status, 200);
+    await expectStats(base, 7, 2, "publish 2★");
+    assert.equal((await call(S.admin, "POST", `/api/admin/reviews/${B.done}`, { action: "hide", reason: null })).status, 422, "hide needs a reason");
+    assert.equal((await moderate(B.done, "hide")).status, 200);
+    await expectStats(base, 2, 1, "hide 5★ removes it");
+    assert.equal((await moderate(B.done, "hide")).status, 409);
+    await expectStats(base, 2, 1, "repeat hide is a no-op");
+    assert.equal((await moderate(B.done, "publish")).status, 200);
+    await expectStats(base, 7, 2, "re-publish restores exactly once");
+    assert.equal((await moderate(B.edge, "hide")).status, 200, "reject a pending review");
+    await expectStats(base, 7, 2, "pending → hidden changes nothing");
+    assert.equal((await moderate(B.edge, "publish")).status, 200);
+    await expectStats(base, 11, 3, "hidden → published adds it");
+    // Concurrent identical moderation: exactly one applies.
+    const racers = await Promise.all(Array.from({ length: 4 }, () => moderate(B.omar, "hide")));
+    assert.deepEqual(racers.map((r) => r.status).sort(), [200, 409, 409, 409]);
+    await expectStats(base, 9, 2, "concurrent hides counted once");
+    const review = (await db.doc(`reviews/${B.omar}`).get()).data();
+    assert.equal(review.status, "hidden");
+    assert.equal(review.moderation.by, S.admin.uid);
+    assert.equal(review.rating, 2, "rating never edited by moderation");
+    // Customers and photographers can't moderate.
+    assert.equal((await call(S.nora, "POST", `/api/admin/reviews/${B.done}`, { action: "hide", reason: "x" })).status, 403);
+    assert.equal((await call(S.alice, "POST", `/api/admin/reviews/${B.omar}`, { action: "publish", reason: null })).status, 403);
+  });
+
+  test("the repair script (read-only by default) finds no drift", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const r = spawnSync("node", ["scripts/recompute-ratings.mjs", "--studio", S.studioA], { env: process.env, encoding: "utf8" });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /mode: read-only/);
+    assert.match(r.stdout, /0 differing/);
+  });
+
+  test("public pages show only safe fields of published reviews", async () => {
+    const html = await fetch(`${BASE}/photographers/${S.slugA}`).then((x) => x.text());
+    assert.ok(html.includes("Nora G."), "published review display name");
+    assert.ok(html.includes("Pia T."), "published review display name");
+    assert.ok(html.includes("Warm, patient team"), "published review text shown");
+    assert.ok(!html.includes("OMAR-HIDDEN-MARKER"), "hidden review text not shown");
+    assert.ok(!html.includes("Omar K."), "hidden review author not shown");
+    for (const secret of [S.nora.uid, S.omar.uid, S.pia.uid, B.done, B.omar, B.edge, "9811111155", "moderation", "customerId", "bookingId", "Not appropriate"]) {
+      assert.ok(!html.includes(secret), `public page leaks ${secret}`);
+    }
+    const s = await stats();
+    assert.match(html, new RegExp(`"reviewCount":${s.reviewCount}`), "structured data uses the published count");
+    assert.match(html, new RegExp(`★ ${s.ratingAverage.toFixed(1)} \\(${s.reviewCount} reviews\\)`), "header shows published rating");
+    assert.match(await fetch(`${BASE}/photographers`).then((x) => x.text()), new RegExp(`★ (<!-- -->)?${s.ratingAverage.toFixed(1)}`), "card shows the rating");
+  });
+
+  test("customer review UI: prompt, form, then status — never editable", async () => {
+    const list = await page("/account/bookings", S.quin);
+    assert.match(list.html, /ready for your review/);
+    assert.match(list.html, /Leave a review/);
+    const before = await page(`/account/bookings/${B.quin}`, S.quin);
+    assert.match(before.html, /id="review-comment"/, "form shown");
+    assert.equal((await submit(S.quin, B.quin, good(3))).status, 201);
+    const after = await page(`/account/bookings/${B.quin}`, S.quin);
+    assert.doesNotMatch(after.html, /id="review-comment"/, "form gone");
+    assert.match(after.html, /waiting to be checked/);
+    assert.match(after.html, /can&#x27;t be edited or deleted|can't be edited or deleted/);
+    assert.doesNotMatch((await page("/account/bookings", S.quin)).html, /ready for your review/);
+    const closed = await page(`/account/bookings/${B.old}`, S.pia);
+    assert.match(closed.html, /review window for this session has closed/);
+    assert.equal((await page(`/account/bookings/${B.done}`, S.omar)).status, 404, "another customer's booking");
+    assert.equal((await page("/admin/reviews?status=pending_moderation", S.admin)).status, 200);
   });
 });
 

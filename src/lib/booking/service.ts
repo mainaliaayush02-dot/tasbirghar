@@ -213,6 +213,7 @@ export async function createBooking(user: CurrentUser, input: BookingCreateInput
       confirmedAt: null,
       completedAt: null,
       cancelledAt: null,
+      reviewedAt: null,
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
     });

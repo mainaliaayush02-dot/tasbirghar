@@ -5,9 +5,12 @@ import { BookingActions } from "@/components/bookings/booking-ui";
 import { BookingStatusPill, customerCopy } from "@/components/bookings/booking-status";
 import { Alert, Card, PageHeader } from "@/components/ui/feedback";
 import { requireUser } from "@/lib/auth/current-user";
-import { nepalNowKey } from "@/lib/booking/rules";
+import { nepalNowKey, nowMs } from "@/lib/booking/rules";
 import { availableActions, bookingPhase } from "@/lib/booking/transitions";
+import { ReviewForm } from "@/components/reviews/review-form";
 import { getCustomerBooking } from "@/lib/data/bookings";
+import { REVIEW_WINDOW_DAYS, reviewEligibility } from "@/lib/reviews/rules";
+import { getOwnReview } from "@/lib/reviews/service";
 import { formatDate, formatDay, formatTimeRange } from "@/lib/format";
 import { formatMoney } from "@/lib/money";
 
@@ -24,6 +27,12 @@ export default async function BookingDetailPage({ params, searchParams }: PagePr
   const created = (await searchParams).created === "1" && phase === "upcoming" && booking.bookingStatus === "pending";
   const status = customerCopy(booking.bookingStatus, phase);
   const actions = availableActions(booking.bookingStatus, "customer", { shootDate: booking.shootDate, startTime: booking.startTime, now });
+  const review = booking.bookingStatus === "completed" ? await getOwnReview(user.uid, booking.id) : null;
+  const completedAtMs = booking.completedAt ? Date.parse(booking.completedAt) : null;
+  const eligibility = reviewEligibility(
+    { bookingStatus: booking.bookingStatus, completedAtMs, reviewed: Boolean(review || booking.reviewedAt) },
+    nowMs(),
+  );
 
   return (
     <main className="space-y-6">
@@ -96,6 +105,34 @@ export default async function BookingDetailPage({ params, searchParams }: PagePr
           )}
         </div>
       </Card>
+      {booking.bookingStatus === "completed" && (
+        <Card title="Your review" description={review ? undefined : eligibility.ok ? `You can review this session until ${formatDate(new Date(eligibility.closesAtMs).toISOString())}.` : undefined}>
+          {review ? (
+            <div className="space-y-2" data-own-review>
+              <p className="text-lg text-brand-600" aria-label={`${review.rating} out of 5 stars`}>
+                {"★".repeat(review.rating)}
+                <span className="text-neutral-300">{"★".repeat(5 - review.rating)}</span>
+              </p>
+              <p className="whitespace-pre-line text-sm text-neutral-800">{review.comment}</p>
+              <p className="text-sm text-neutral-500">
+                {review.status === "pending_moderation"
+                  ? "Thanks! Your review is waiting to be checked by TasbirGhar before it appears on the studio page."
+                  : review.status === "published"
+                    ? "Published on the studio page."
+                    : "This review isn't shown publicly."}{" "}
+                Reviews can&apos;t be edited or deleted —{" "}
+                <Link href="/contact" className="font-medium text-brand-700 hover:underline">contact TasbirGhar</Link> if something needs correcting.
+              </p>
+            </div>
+          ) : eligibility.ok ? (
+            <ReviewForm bookingId={booking.id} studioName={booking.studio.businessName} />
+          ) : (
+            <p className="text-sm text-neutral-500">
+              The review window for this session has closed (reviews can be written up to {REVIEW_WINDOW_DAYS} days after completion).
+            </p>
+          )}
+        </Card>
+      )}
     </main>
   );
 }

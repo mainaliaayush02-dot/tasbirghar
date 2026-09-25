@@ -326,9 +326,10 @@ describe("unauthenticated", () => {
     await assertFails(getDocs(collection(anon(), "studioSlugs")));
     await assertFails(setDoc(ref(anon(), "studioSlugs/hijack"), { studioId: "studioA" }));
   });
-  test("CAN read published reviews only", async () => {
-    await assertSucceeds(getDoc(ref(anon(), "reviews/b1")));
+  test("cannot read any review document, even a published one (public pages use a server-side projection)", async () => {
+    await assertFails(getDoc(ref(anon(), "reviews/b1")));
     await assertFails(getDoc(ref(anon(), "reviews/b2")));
+    await assertFails(getDocs(collection(anon(), "reviews")));
   });
 });
 
@@ -985,5 +986,45 @@ describe("customer booking locks are server-only (Phase 4B-1)", () => {
     await env.withSecurityRulesDisabled((ctx) => setDoc(doc(ctx.firestore(), "customerLocks/alice"), lock));
     await assertFails(getDoc(ref(customer("alice"), "customerLocks/alice")));
     await assertFails(updateDoc(ref(customer("alice"), "customerLocks/alice"), { writes: 0 }));
+  });
+});
+
+
+/* ------------------------------------------------------ reviews (Phase 4B-2) */
+
+describe("review documents: private to their customer and admins (Phase 4B-2)", () => {
+  test("the customer CAN read their own review (published or not)", async () => {
+    await assertSucceeds(getDoc(ref(customer("alice"), "reviews/b1")));
+    await assertSucceeds(getDoc(ref(customer("bob"), "reviews/b2")));
+  });
+  test("other customers cannot read someone else's review, even a published one", async () => {
+    await assertFails(getDoc(ref(customer("bob"), "reviews/b1")));
+    await assertFails(getDoc(ref(customerWithClaim("bob"), "reviews/b1")));
+    await assertFails(getDocs(query(collection(customer("bob"), "reviews"), where("status", "==", "published"))));
+    await assertFails(getDocs(query(collection(customer("bob"), "reviews"), where("studioId", "==", "studioA"))));
+  });
+  test("studio owners cannot read reviews of their studio from the client (no customerId/bookingId leak)", async () => {
+    await assertFails(getDoc(ref(photographer("pa"), "reviews/b1")));
+    await assertFails(getDocs(query(collection(photographer("pa"), "reviews"), where("studioId", "==", "studioA"))));
+  });
+  test("admins CAN read any review", async () => {
+    await assertSucceeds(getDoc(ref(admin(), "reviews/b1")));
+    await assertSucceeds(getDoc(ref(admin(), "reviews/b2")));
+    await assertSucceeds(getDocs(collection(admin(), "reviews")));
+  });
+  test("nobody can create, edit, publish or delete reviews from the client", async () => {
+    const forged = reviewDoc("b9", "alice", "studioA", "published");
+    for (const db of [anon(), customer("alice"), photographer("pa"), admin()]) {
+      await assertFails(setDoc(ref(db, "reviews/b9"), forged));
+      await assertFails(updateDoc(ref(db, "reviews/b1"), { rating: 1 }));
+      await assertFails(updateDoc(ref(db, "reviews/b1"), { comment: "edited" }));
+      await assertFails(updateDoc(ref(db, "reviews/b2"), { status: "published" }));
+      await assertFails(deleteDoc(ref(db, "reviews/b1")));
+    }
+  });
+  test("customers and owners cannot touch booking.reviewedAt or studio rating stats", async () => {
+    await assertFails(updateDoc(ref(customer("alice"), "bookings/b1"), { reviewedAt: "2026-10-01" }));
+    await assertFails(updateDoc(ref(photographer("pa"), "studios/studioA"), { "stats.ratingSum": 999 }));
+    await assertFails(updateDoc(ref(photographer("pa"), "studios/studioA"), { stats: { ratingAverage: 5, reviewCount: 99, ratingSum: 495, portfolioCount: 1, completedBookings: 3 } }));
   });
 });

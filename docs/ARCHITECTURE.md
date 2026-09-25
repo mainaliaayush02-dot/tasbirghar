@@ -464,6 +464,38 @@ Dashboards classify each booking by status **and** time (`bookingPhase` in `tran
 
 ---
 
+## 6b. Reviews and ratings (Phase 4B-2)
+
+**Model.** `reviews/{bookingId}`: the document id *is* the booking id, so a booking can have at most one review. Fields: `bookingId`, `studioId`, `customerId`, `customerDisplayName`, `rating` (1–5), `comment`, `status` (`pending_moderation` | `published` | `hidden`), `studioReply` (reserved; studio replies aren't built), `moderation` (last admin action: action, by, at, reason), timestamps. The booking gets `reviewedAt`, and the studio's `stats` gets `ratingSum` next to `reviewCount` and `ratingAverage`.
+
+**Submitting (`POST /api/bookings/{bookingId}/review { rating, comment }`).** Customer role only. In one transaction the server:
+- reads the booking, and refuses (404) if it doesn't exist or isn't the caller's, so no existence leak;
+- refuses (403) if the caller owns the studio;
+- requires `completed` status, no existing review or `reviewedAt`, and completion within **60 days** (`REVIEW_WINDOW_DAYS`);
+- `tx.create`s the review and sets `booking.reviewedAt`.
+
+Concurrent or repeated submissions therefore produce exactly one review; the rest get 409 `ALREADY_REVIEWED`. The body may contain only a JSON integer `rating` from 1–5 and a `comment` of 20–1,000 characters (`src/lib/reviews/rules.ts`). Everything else is derived server-side and any other field is rejected with 422: studio, customer, booking, display name, status and timestamps. The display name is privacy-safe: first name plus last initial from the account ("Anjali S."), with digits and symbols stripped. Pending, confirmed, cancelled, declined and expired bookings get 409 `NOT_COMPLETED`; after 60 days, 409 `REVIEW_WINDOW_CLOSED`.
+
+**Customers can't edit or delete reviews.** There's no PUT, PATCH or DELETE (405); the page directs them to TasbirGhar support for corrections.
+
+**Moderation (`POST /api/admin/reviews/{id}`, admin only).** New reviews start as `pending_moderation` and are never public until an admin publishes them.
+- *Publish* works from pending or hidden.
+- *Hide* ("Don't publish" for pending) needs a reason.
+- Repeating the current state is refused (409 `NO_CHANGE`), so repeated or concurrent actions are idempotent.
+- Rating and text are never editable.
+
+**Rating accounting.** Only **published** reviews count. The same moderation transaction reads the studio and applies `applyReviewStatusChange`: crossing into published adds the rating to `ratingSum` and 1 to `reviewCount`, crossing out removes them, and anything else changes nothing. It then sets `ratingAverage` (2 decimals). Hiding and re-publishing therefore restores the totals exactly once. If the stored totals would go negative, the action is refused (409 `STATS_INCONSISTENT`) rather than written. `npm run ratings:recompute` rebuilds the expected totals from published reviews. It's **read-only by default**, and `--apply` is needed to write. A missing `ratingSum` on older studios is treated as average × count.
+
+**Public output.** Studio pages read published reviews server-side and expose only rating, comment, display name and date (`PublicReview`: no ids, customer or moderation data). Firestore rules no longer allow public reads of review documents: only the review's own customer and admins can read them, and nobody can write them from the client.
+
+**UI.**
+- **Customer:** the bookings list shows a "ready for your review" prompt and a "Leave a review" link. The booking page shows the review form (stars plus text with a counter), then the review's status (waiting for moderation / published / not shown publicly), or a "window closed" note.
+- **Admin:** the review queue (Awaiting moderation / Published / Hidden) offers Publish and Don't publish/Hide.
+
+**Not built:** studio replies, notifications for new reviews (4B-3), review reminders beyond the dashboard prompt, and a moderation history (only the last action is stored, as before).
+
+---
+
 ## 7. Money and commission model
 
 **Decision: all amounts are integers in minor units (paisa, where 1 NPR = 100 paisa). Rates are integers in basis points.**
@@ -529,12 +561,12 @@ Local values go in `.env.local`, which is gitignored. Production and preview val
 
 ### Firestore rules: what clients may do
 
-`firestore.rules` is deny-by-default and is covered by `tests/firestore-rules.test.mjs` (126 emulator tests). Client updates use **field allowlists**, so any field not listed is immutable from the client SDK.
+`firestore.rules` is deny-by-default and is covered by `tests/firestore-rules.test.mjs` (132 emulator tests). Client updates use **field allowlists**, so any field not listed is immutable from the client SDK.
 
 | Actor | Allowed | Everything else |
 | --- | --- | --- |
-| Anyone (signed out) | Read published studios and their portfolio, gallery, packages and availability. `get` a single `studioSlugs/{slug}`. Read published reviews. | Denied, including draft studios, listing slugs and every `studios/{id}/private/*` doc |
-| Signed-in user (customer) | Create own `users/{uid}` with `role: "customer"`, `studioId: null`, `photo: null`. Read own user doc. Update own `displayName`, `phone`, `updatedAt`. Read own bookings and own reviews. | Denied |
+| Anyone (signed out) | Read published studios and their portfolio, gallery, packages and availability. `get` a single `studioSlugs/{slug}`. (Published reviews reach the public only through the server-rendered studio page, not Firestore.) | Denied, including draft studios, listing slugs and every `studios/{id}/private/*` doc |
+| Signed-in user (customer) | Create own `users/{uid}` with `role: "customer"`, `studioId: null`, `photo: null`. Read own user doc. Update own `displayName`, `phone`, `updatedAt`. Read own bookings and own review documents. | Denied, including other customers' reviews (published or not) |
 | Photographer (owner: `users/{uid}.studioId` equals the studio id) | `get` own `private/contact` (not `private/internal`). Update own studio: `businessName`, `description`, `location` (keys `city`, `area`, `geo` only), `categories`, `facilities`, `props`, `updatedAt`. Portfolio: update `caption`, `category`, `sortOrder`, `isFeatured`, or delete. Gallery: update `caption`, `sortOrder`, or delete. Packages: create with `images: []`, NPR and an integer price; update details and price; delete. Read own availability (writes go through the owner API since Phase 4A). Read bookings where `studioOwnerId` is the photographer's uid. | Denied, including every other studio |
 | Admin (claim) | **Read** users, studios (including drafts) and their subcollections, `private/contact` and `private/internal` (single `get`), bookings and reviews. | **All client writes denied.** Admin mutations (moderation, commission, role grants) go through server routes using the Admin SDK. |
 | Server (Admin SDK) | Everything, since it bypasses rules: studio creation and slug reservation, `private/contact` and `private/internal`, availability, statuses, commission, stats, `startingPrice`, all `MediaAsset` fields, portfolio and gallery creation, package images, role claims and mirror, bookings, reviews. | n/a |

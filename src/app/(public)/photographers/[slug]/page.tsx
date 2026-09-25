@@ -264,8 +264,8 @@ export default async function StudioProfilePage({ params }: PageProps<"/photogra
             <h2 id="reviews-heading" className="font-display text-2xl text-ink sm:text-3xl">Reviews</h2>
             {hasReviews ? (
               <ul className="mt-6 space-y-6">
-                {studio.reviews.map((r) => (
-                  <li key={r.id} className="border-t border-ink/10 pt-6">
+                {studio.reviews.map((r, i) => (
+                  <li key={i} className="border-t border-ink/10 pt-6">
                     <p className="text-brand-600" aria-label={`${r.rating} out of 5 stars`}>
                       {"★".repeat(r.rating)}
                       <span className="text-ink/15">{"★".repeat(5 - r.rating)}</span>

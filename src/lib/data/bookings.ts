@@ -27,6 +27,9 @@ export interface CustomerBookingDTO {
   customerNote: string | null;
   createdAt: string | null;
   confirmedAt: string | null;
+  completedAt: string | null;
+  /** Set once the customer has submitted a review for this booking. */
+  reviewedAt: string | null;
 }
 
 /** Studio-facing view — includes the photographer's payout. */
@@ -53,6 +56,8 @@ function toCustomer(d: DocumentSnapshot): CustomerBookingDTO {
     customerNote: b.customerNote,
     createdAt: toIso(b.createdAt),
     confirmedAt: toIso(b.confirmedAt),
+    completedAt: toIso(b.completedAt),
+    reviewedAt: toIso(b.reviewedAt ?? null),
   };
 }
 

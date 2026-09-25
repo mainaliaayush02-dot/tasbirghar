@@ -2,10 +2,11 @@ import Link from "next/link";
 
 import { BookingStatusPill, customerCopy } from "@/components/bookings/booking-status";
 import { ButtonLink } from "@/components/ui/button";
-import { Card, PageHeader } from "@/components/ui/feedback";
+import { Alert, Card, PageHeader } from "@/components/ui/feedback";
 import { requireUser } from "@/lib/auth/current-user";
-import { nepalNowKey } from "@/lib/booking/rules";
+import { nepalNowKey, nowMs } from "@/lib/booking/rules";
 import { bookingPhase, type BookingPhase } from "@/lib/booking/transitions";
+import { reviewEligibility } from "@/lib/reviews/rules";
 import { listCustomerBookings, type CustomerBookingDTO } from "@/lib/data/bookings";
 import { formatDate, formatDay, formatTimeRange } from "@/lib/format";
 import { formatMoney } from "@/lib/money";
@@ -20,7 +21,13 @@ const ACCENT: Record<string, string> = {
   danger: "border-l-red-400",
 };
 
-function BookingCard({ b, phase }: { b: CustomerBookingDTO; phase: BookingPhase }) {
+const canReview = (b: CustomerBookingDTO, nowMs: number) =>
+  reviewEligibility(
+    { bookingStatus: b.bookingStatus, completedAtMs: b.completedAt ? Date.parse(b.completedAt) : null, reviewed: Boolean(b.reviewedAt) },
+    nowMs,
+  ).ok;
+
+function BookingCard({ b, phase, reviewable = false }: { b: CustomerBookingDTO; phase: BookingPhase; reviewable?: boolean }) {
   const copy = customerCopy(b.bookingStatus, phase);
   return (
     <li>
@@ -46,6 +53,7 @@ function BookingCard({ b, phase }: { b: CustomerBookingDTO; phase: BookingPhase 
         <p className="mt-3 text-xs text-neutral-500">
           <span className="font-mono break-all">#{b.id}</span> · requested {formatDate(b.createdAt)}
         </p>
+        {reviewable && <p className="mt-2 text-sm font-medium text-brand-700">Leave a review →</p>}
       </Link>
     </li>
   );
@@ -63,6 +71,9 @@ export default async function MyBookingsPage() {
     .filter((x) => x.phase === "upcoming")
     .sort((x, y) => `${x.b.shootDate}${x.b.startTime}`.localeCompare(`${y.b.shootDate}${y.b.startTime}`));
   const past = withPhase.filter((x) => x.phase !== "upcoming");
+  // Dashboard prompt (derived — no stored reminders): completed sessions still open for review.
+  const requestMs = nowMs();
+  const toReview = bookings.filter((b) => canReview(b, requestMs));
 
   return (
     <main className="space-y-6">
@@ -81,6 +92,20 @@ export default async function MyBookingsPage() {
         </Card>
       ) : (
         <>
+          {toReview.length > 0 && (
+            <Alert tone="info" title={`${toReview.length} session${toReview.length === 1 ? "" : "s"} ready for your review`}>
+              Tell other families how it went:{" "}
+              {toReview.map((b, i) => (
+                <span key={b.id}>
+                  {i > 0 && ", "}
+                  <Link href={`/account/bookings/${b.id}`} className="font-medium underline">
+                    {b.studio.businessName}
+                  </Link>
+                </span>
+              ))}
+              .
+            </Alert>
+          )}
           {upcoming.length > 0 && (
             <section aria-labelledby="upcoming">
               <h2 id="upcoming" className="mb-3 text-sm font-semibold tracking-wide text-neutral-500 uppercase">Upcoming</h2>
@@ -90,7 +115,7 @@ export default async function MyBookingsPage() {
           {past.length > 0 && (
             <section aria-labelledby="history">
               <h2 id="history" className="mb-3 text-sm font-semibold tracking-wide text-neutral-500 uppercase">History</h2>
-              <ul className="space-y-3">{past.map((x) => <BookingCard key={x.b.id} b={x.b} phase={x.phase} />)}</ul>
+              <ul className="space-y-3">{past.map((x) => <BookingCard key={x.b.id} b={x.b} phase={x.phase} reviewable={canReview(x.b, requestMs)} />)}</ul>
             </section>
           )}
         </>

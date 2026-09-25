@@ -58,7 +58,7 @@ export const POST = apiRoute(async (request) => {
       publishedAt: null,
       startingPrice: null,
       currency: "NPR",
-      stats: { ratingAverage: 0, reviewCount: 0, portfolioCount: 0, completedBookings: 0 },
+      stats: { ratingAverage: 0, reviewCount: 0, ratingSum: 0, portfolioCount: 0, completedBookings: 0 },
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
     });

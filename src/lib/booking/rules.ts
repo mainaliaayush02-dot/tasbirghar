@@ -55,6 +55,9 @@ export function nepalNowKey(now: Date = new Date()): string {
   return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}`;
 }
 
+/** Current time in ms — the request time for per-request server rendering. */
+export const nowMs = (): number => Date.now();
+
 export function addDays(date: string, days: number): string {
   const d = new Date(`${date}T00:00:00Z`);
   d.setUTCDate(d.getUTCDate() + days);

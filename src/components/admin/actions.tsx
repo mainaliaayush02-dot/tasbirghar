@@ -160,24 +160,29 @@ export function StudioModerationActions({
 export function ReviewModerationActions({ reviewId, status }: { reviewId: string; status: string }) {
   const run = useAction();
   const path = `/api/admin/reviews/${reviewId}`;
-  return status === "published" ? (
+  const hide = (
     <ConfirmDialog
-      title="Hide this review?"
-      description="The review stays on record but is no longer shown publicly."
+      title={status === "published" ? "Hide this review?" : "Don't publish this review?"}
+      description={
+        status === "published"
+          ? "The review stays on record but is no longer shown publicly, and it stops counting toward the studio's rating."
+          : "The review stays on record but is never shown publicly and doesn't count toward the studio's rating."
+      }
       reason={{ label: "Reason", required: true }}
-      confirmLabel="Hide review"
+      confirmLabel={status === "published" ? "Hide review" : "Don't publish"}
       tone="danger"
       onConfirm={(reason) => run(path, { action: "hide", reason })}
       trigger={(open) => (
         <Button size="sm" variant="danger" onClick={open}>
-          Hide
+          {status === "published" ? "Hide" : "Don't publish"}
         </Button>
       )}
     />
-  ) : (
+  );
+  const publish = (
     <ConfirmDialog
       title="Publish this review?"
-      description="The review becomes visible on the studio's public page."
+      description="The review becomes visible on the studio's public page and counts toward its rating."
       confirmLabel="Publish review"
       onConfirm={() => run(path, { action: "publish", reason: null })}
       trigger={(open) => (
@@ -186,5 +191,12 @@ export function ReviewModerationActions({ reviewId, status }: { reviewId: string
         </Button>
       )}
     />
+  );
+  // pending → publish or reject; published → hide; hidden → publish again.
+  return (
+    <div className="flex flex-wrap justify-end gap-2">
+      {status !== "published" && publish}
+      {status !== "hidden" && hide}
+    </div>
   );
 }

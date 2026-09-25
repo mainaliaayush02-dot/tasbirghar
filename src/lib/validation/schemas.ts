@@ -2,6 +2,7 @@ import { PHOTOGRAPHY_CATEGORIES, type CategorySlug } from "@/config/categories";
 import { LOCATIONS, type LocationSlug } from "@/config/locations";
 import { MAX_SLOTS_PER_DAY } from "@/lib/booking/rules";
 import { BOOKING_ACTIONS, type BookingAction } from "@/lib/booking/transitions";
+import { COMMENT_MAX, COMMENT_MIN, RATING_MAX, RATING_MIN } from "@/lib/reviews/rules";
 import type { GalleryImageKind } from "@/types/models";
 
 import {
@@ -275,6 +276,31 @@ export interface ReviewModerationInput {
   action: (typeof REVIEW_MODERATION_ACTIONS)[number];
   reason: string | null;
 }
+
+/* -------------------------------------------------------------- reviews */
+
+export interface ReviewSubmitInput {
+  rating: number;
+  comment: string;
+}
+
+/** Strict JSON integer (no numeric strings) — ratings come from our own form. */
+function jsonInt(min: number, max: number) {
+  return (value: unknown) =>
+    typeof value === "number" && Number.isInteger(value) && value >= min && value <= max
+      ? { ok: true as const, value }
+      : { ok: false as const, error: `Choose a whole number from ${min} to ${max}.` };
+}
+
+/**
+ * The client sends only its rating and words. Booking, studio, customer,
+ * display name, status and timestamps are all server-derived — sending them
+ * is rejected as an unexpected field.
+ */
+export const reviewSubmitSchema: Schema<ReviewSubmitInput> = {
+  rating: jsonInt(RATING_MIN, RATING_MAX),
+  comment: text({ min: COMMENT_MIN, max: COMMENT_MAX, multiline: true }),
+};
 
 export const reviewModerationSchema: Schema<ReviewModerationInput> = {
   action: oneOf(REVIEW_MODERATION_ACTIONS, "Unknown action."),

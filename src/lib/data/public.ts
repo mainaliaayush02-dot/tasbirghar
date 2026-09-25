@@ -50,8 +50,8 @@ export interface PublicStudioCard {
   publishedAt: string | null;
 }
 
+/** Public projection of a PUBLISHED review — no booking, customer or moderation data. */
 export interface PublicReview {
-  id: string;
   customerDisplayName: string;
   rating: number;
   comment: string;
@@ -143,7 +143,6 @@ export const getPublishedStudioBySlug = unstable_cache(
         .map((d) => {
           const r = d.data() as ReviewDoc;
           return {
-            id: d.id,
             customerDisplayName: r.customerDisplayName,
             rating: r.rating,
             comment: r.comment,

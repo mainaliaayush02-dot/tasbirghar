@@ -102,9 +102,16 @@ export interface StudioDoc extends Timestamps {
   /** Lowest active package price, maintained server-side for budget filters. */
   startingPrice: MinorUnits | null;
   currency: Currency;
+  /**
+   * Denormalized counters, server-maintained. Rating fields count PUBLISHED
+   * reviews only and change in the same transaction that moves a review
+   * across the published boundary (see src/lib/reviews/service.ts).
+   */
   stats: {
     ratingAverage: number;
     reviewCount: number;
+    /** Sum of published ratings (missing on studios created before Phase 4B-2 → 0). */
+    ratingSum?: number;
     portfolioCount: number;
     completedBookings: number;
   };
@@ -276,25 +283,42 @@ export interface BookingDoc extends Timestamps {
   confirmedAt: Timestamp | null;
   completedAt: Timestamp | null;
   cancelledAt: Timestamp | null;
+  /** Set (server-side, in the review transaction) when the customer submits a review. */
+  reviewedAt?: Timestamp | null;
 }
 
 /* ---------------------------------------------------------------- reviews */
 
 export type ReviewStatus = "published" | "hidden" | "pending_moderation";
 
+export interface ReviewModeration {
+  action: "publish" | "hide";
+  by: string;
+  at: Timestamp;
+  reason: string | null;
+}
+
 /**
  * reviews/{bookingId}. Keyed by booking id, which enforces one review per
  * booking and makes every review "verified" (tied to a completed booking).
+ * Created only by the server (POST /api/bookings/{id}/review) as
+ * `pending_moderation`; only admins change `status`. Never edited or deleted
+ * by the customer. Never read directly by the public: public pages get a
+ * safe projection (rating, comment, display name, date) from server code.
  */
 export interface ReviewDoc extends Timestamps {
   bookingId: string;
   studioId: string;
   customerId: string;
+  /** Privacy-safe, server-generated ("Anjali S."). Never taken from the client. */
   customerDisplayName: string;
   rating: 1 | 2 | 3 | 4 | 5;
   comment: string;
   status: ReviewStatus;
+  /** Reserved for a later phase (studio replies are not built yet). */
   studioReply: string | null;
+  /** Last admin moderation action. */
+  moderation?: ReviewModeration | null;
 }
 
 /* ------------------------------------------------ photographer onboarding */
