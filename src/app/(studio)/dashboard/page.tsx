@@ -1,8 +1,11 @@
 import Link from "next/link";
 
 import { ButtonLink } from "@/components/ui/button";
-import { Badge, Card, PageHeader } from "@/components/ui/feedback";
+import { Alert, Badge, Card, PageHeader } from "@/components/ui/feedback";
 import { requireUser } from "@/lib/auth/current-user";
+import { nepalNowKey } from "@/lib/booking/rules";
+import { bookingPhase } from "@/lib/booking/transitions";
+import { listStudioBookings } from "@/lib/data/bookings";
 import { LISTING_LABEL, VERIFICATION_LABEL } from "@/lib/data/dashboard";
 import { getOwnedStudio, listGallery, listPackages } from "@/lib/data/studios";
 import { formatMoney } from "@/lib/money";
@@ -30,7 +33,15 @@ export default async function DashboardOverview() {
     );
   }
 
-  const [gallery, packages] = await Promise.all([listGallery(studio.id), listPackages(studio.id)]);
+  const [gallery, packages, bookings] = await Promise.all([
+    listGallery(studio.id),
+    listPackages(studio.id),
+    listStudioBookings(studio.id, user.uid),
+  ]);
+  // Dashboard prompts (derived from bookings — no stored reminders).
+  const now = nepalNowKey();
+  const toReply = bookings.filter((b) => b.bookingStatus === "pending" && bookingPhase(b, now) === "upcoming").length;
+  const toComplete = bookings.filter((b) => bookingPhase(b, now) === "needs_completion").length;
   const activePackages = packages.filter((p) => p.isActive);
 
   const checklist = [
@@ -57,6 +68,29 @@ export default async function DashboardOverview() {
           </div>
         }
       />
+
+      {(toReply > 0 || toComplete > 0) && (
+        <div className="mb-6">
+          <Alert tone="warning" title="Needs your attention">
+            <ul className="mt-1 space-y-1">
+              {toReply > 0 && (
+                <li>
+                  <Link href="/dashboard/bookings?status=pending" className="font-medium underline">
+                    {toReply} booking request{toReply === 1 ? "" : "s"} waiting for your reply
+                  </Link>
+                </li>
+              )}
+              {toComplete > 0 && (
+                <li>
+                  <Link href="/dashboard/bookings?status=confirmed" className="font-medium underline">
+                    {toComplete} session{toComplete === 1 ? "" : "s"} to mark completed
+                  </Link>
+                </li>
+              )}
+            </ul>
+          </Alert>
+        </div>
+      )}
 
       <div className="grid gap-4 sm:grid-cols-3">
         {[

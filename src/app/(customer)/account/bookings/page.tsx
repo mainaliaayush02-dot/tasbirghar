@@ -1,10 +1,11 @@
 import Link from "next/link";
 
-import { BookingStatusPill, CUSTOMER_STATUS_COPY } from "@/components/bookings/booking-status";
+import { BookingStatusPill, customerCopy } from "@/components/bookings/booking-status";
 import { ButtonLink } from "@/components/ui/button";
 import { Card, PageHeader } from "@/components/ui/feedback";
 import { requireUser } from "@/lib/auth/current-user";
-import { ACTIVE_BOOKING_STATUSES } from "@/lib/booking/rules";
+import { nepalNowKey } from "@/lib/booking/rules";
+import { bookingPhase, type BookingPhase } from "@/lib/booking/transitions";
 import { listCustomerBookings, type CustomerBookingDTO } from "@/lib/data/bookings";
 import { formatDate, formatDay, formatTimeRange } from "@/lib/format";
 import { formatMoney } from "@/lib/money";
@@ -19,8 +20,8 @@ const ACCENT: Record<string, string> = {
   danger: "border-l-red-400",
 };
 
-function BookingCard({ b }: { b: CustomerBookingDTO }) {
-  const copy = CUSTOMER_STATUS_COPY[b.bookingStatus];
+function BookingCard({ b, phase }: { b: CustomerBookingDTO; phase: BookingPhase }) {
+  const copy = customerCopy(b.bookingStatus, phase);
   return (
     <li>
       <Link
@@ -33,7 +34,7 @@ function BookingCard({ b }: { b: CustomerBookingDTO }) {
             <p className="mt-1 font-semibold text-neutral-900">{b.studio.businessName}</p>
             <p className="text-sm text-neutral-500">{b.packageName}</p>
           </div>
-          <BookingStatusPill status={b.bookingStatus} />
+          <BookingStatusPill status={b.bookingStatus} expired={phase === "expired"} />
         </div>
         <div className="mt-3 flex flex-wrap items-end justify-between gap-2 text-sm">
           <span className="text-neutral-700">
@@ -53,11 +54,15 @@ function BookingCard({ b }: { b: CustomerBookingDTO }) {
 export default async function MyBookingsPage() {
   const user = await requireUser("account", "/account/bookings");
   const bookings = await listCustomerBookings(user.uid);
-  // Upcoming open bookings first (soonest first); history after (latest first).
-  const upcoming = bookings
-    .filter((b) => ACTIVE_BOOKING_STATUSES.includes(b.bookingStatus))
-    .sort((a, b) => `${a.shootDate}${a.startTime}`.localeCompare(`${b.shootDate}${b.startTime}`));
-  const past = bookings.filter((b) => !ACTIVE_BOOKING_STATUSES.includes(b.bookingStatus));
+  // Upcoming = pending/confirmed whose start time is still ahead (soonest first).
+  // Everything else — including expired requests and sessions whose time has
+  // passed — is history (latest first).
+  const now = nepalNowKey();
+  const withPhase = bookings.map((b) => ({ b, phase: bookingPhase(b, now) }));
+  const upcoming = withPhase
+    .filter((x) => x.phase === "upcoming")
+    .sort((x, y) => `${x.b.shootDate}${x.b.startTime}`.localeCompare(`${y.b.shootDate}${y.b.startTime}`));
+  const past = withPhase.filter((x) => x.phase !== "upcoming");
 
   return (
     <main className="space-y-6">
@@ -79,13 +84,13 @@ export default async function MyBookingsPage() {
           {upcoming.length > 0 && (
             <section aria-labelledby="upcoming">
               <h2 id="upcoming" className="mb-3 text-sm font-semibold tracking-wide text-neutral-500 uppercase">Upcoming</h2>
-              <ul className="space-y-3">{upcoming.map((b) => <BookingCard key={b.id} b={b} />)}</ul>
+              <ul className="space-y-3">{upcoming.map((x) => <BookingCard key={x.b.id} b={x.b} phase={x.phase} />)}</ul>
             </section>
           )}
           {past.length > 0 && (
             <section aria-labelledby="history">
               <h2 id="history" className="mb-3 text-sm font-semibold tracking-wide text-neutral-500 uppercase">History</h2>
-              <ul className="space-y-3">{past.map((b) => <BookingCard key={b.id} b={b} />)}</ul>
+              <ul className="space-y-3">{past.map((x) => <BookingCard key={x.b.id} b={x.b} phase={x.phase} />)}</ul>
             </section>
           )}
         </>

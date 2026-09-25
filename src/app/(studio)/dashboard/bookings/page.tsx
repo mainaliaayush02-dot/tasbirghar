@@ -2,43 +2,47 @@ import Link from "next/link";
 
 import { BookingActions } from "@/components/bookings/booking-ui";
 import { BookingStatusPill } from "@/components/bookings/booking-status";
-import { Card, PageHeader } from "@/components/ui/feedback";
-import { ACTIVE_BOOKING_STATUSES, nepalToday } from "@/lib/booking/rules";
-import { availableActions } from "@/lib/booking/transitions";
+import { Alert, Card, PageHeader } from "@/components/ui/feedback";
+import { nepalNowKey } from "@/lib/booking/rules";
+import { availableActions, bookingPhase, type BookingPhase } from "@/lib/booking/transitions";
 import { listStudioBookings, type StudioBookingDTO } from "@/lib/data/bookings";
 import { requireStudio } from "@/lib/data/dashboard";
-import { formatDate, formatDay, formatTimeRange } from "@/lib/format";
+import { formatDate, formatDay, formatTime, formatTimeRange } from "@/lib/format";
 import { formatMoney } from "@/lib/money";
-import type { BookingStatus } from "@/types/models";
 
 export const metadata = { title: "Bookings" };
 
-const TABS: { value: string; label: string; statuses: BookingStatus[] | null }[] = [
-  { value: "", label: "All", statuses: null },
-  { value: "pending", label: "Pending", statuses: ["pending"] },
-  { value: "confirmed", label: "Confirmed", statuses: ["confirmed"] },
-  { value: "completed", label: "Completed", statuses: ["completed"] },
-  { value: "cancelled", label: "Cancelled", statuses: ["cancelled_by_customer", "cancelled_by_studio"] },
-  { value: "declined", label: "Declined", statuses: ["declined"] },
+type Row = { b: StudioBookingDTO; phase: BookingPhase };
+
+/** Tabs match on the stored status AND the booking's time (expiry is derived). */
+const TABS: { value: string; label: string; match: (r: Row) => boolean }[] = [
+  { value: "", label: "All", match: () => true },
+  { value: "pending", label: "Pending", match: (r) => r.b.bookingStatus === "pending" && r.phase === "upcoming" },
+  { value: "confirmed", label: "Confirmed", match: (r) => r.b.bookingStatus === "confirmed" },
+  { value: "completed", label: "Completed", match: (r) => r.b.bookingStatus === "completed" },
+  { value: "cancelled", label: "Cancelled", match: (r) => r.b.bookingStatus === "cancelled_by_customer" || r.b.bookingStatus === "cancelled_by_studio" },
+  { value: "declined", label: "Declined", match: (r) => r.b.bookingStatus === "declined" },
+  { value: "expired", label: "Expired", match: (r) => r.phase === "expired" },
 ];
 
-/** Upcoming open bookings first (soonest first), then history (latest first). */
-function order(a: StudioBookingDTO, b: StudioBookingDTO) {
-  const openA = ACTIVE_BOOKING_STATUSES.includes(a.bookingStatus);
-  const openB = ACTIVE_BOOKING_STATUSES.includes(b.bookingStatus);
-  if (openA !== openB) return openA ? -1 : 1;
-  const key = (x: StudioBookingDTO) => `${x.shootDate}${x.startTime}`;
-  return openA ? key(a).localeCompare(key(b)) : key(b).localeCompare(key(a));
+/** Sessions to complete first, then upcoming (soonest first), then history (latest first). */
+const RANK: Record<BookingPhase, number> = { needs_completion: 0, upcoming: 1, expired: 2, past: 2 };
+function order(x: Row, y: Row) {
+  if (RANK[x.phase] !== RANK[y.phase]) return RANK[x.phase] - RANK[y.phase];
+  const key = (r: Row) => `${r.b.shootDate}${r.b.startTime}`;
+  return RANK[x.phase] < 2 ? key(x).localeCompare(key(y)) : key(y).localeCompare(key(x));
 }
 
 export default async function StudioBookingsPage({ searchParams }: PageProps<"/dashboard/bookings">) {
   const { user, studio } = await requireStudio("/dashboard/bookings");
   const bookings = await listStudioBookings(studio.id, user.uid);
-  const today = nepalToday();
+  const now = nepalNowKey();
+  const rows: Row[] = bookings.map((b) => ({ b, phase: bookingPhase(b, now) }));
   const sp = await searchParams;
   const tab = TABS.find((t) => t.value === sp.status) ?? TABS[0];
-  const shown = bookings.filter((b) => !tab.statuses || tab.statuses.includes(b.bookingStatus)).sort(order);
-  const count = (t: (typeof TABS)[number]) => bookings.filter((b) => !t.statuses || t.statuses.includes(b.bookingStatus)).length;
+  const shown = rows.filter(tab.match).sort(order);
+  const count = (t: (typeof TABS)[number]) => rows.filter(t.match).length;
+  const toComplete = rows.filter((r) => r.phase === "needs_completion").length;
 
   return (
     <>
@@ -46,6 +50,17 @@ export default async function StudioBookingsPage({ searchParams }: PageProps<"/d
         title="Bookings"
         description="Confirm or decline requests, then mark sessions completed. Confirmed times are reserved for the customer."
       />
+      {toComplete > 0 && (
+        <div className="mb-4">
+          <Alert tone="warning" title={`${toComplete} session${toComplete === 1 ? "" : "s"} to mark completed`}>
+            These confirmed sessions have started.{" "}
+            <Link href="/dashboard/bookings?status=confirmed" className="font-medium underline">
+              Mark them completed
+            </Link>{" "}
+            once they&apos;re done, or cancel any that didn&apos;t take place.
+          </Alert>
+        </div>
+      )}
       <nav aria-label="Booking status" className="-mx-4 mb-4 overflow-x-auto px-4 sm:mx-0 sm:px-0">
         <ul className="flex w-max gap-1 rounded-xl border border-neutral-200 bg-white p-1">
           {TABS.map((t) => {
@@ -71,13 +86,13 @@ export default async function StudioBookingsPage({ searchParams }: PageProps<"/d
       {shown.length === 0 ? (
         <Card>
           <p className="py-6 text-center text-sm text-neutral-500">
-            {tab.statuses ? `No ${tab.label.toLowerCase()} bookings.` : "No bookings yet. Requests appear here when customers book from your studio page."}
+            {tab.value ? `No ${tab.label.toLowerCase()} bookings.` : "No bookings yet. Requests appear here when customers book from your studio page."}
           </p>
         </Card>
       ) : (
         <ul className="space-y-3">
-          {shown.map((b) => {
-            const actions = availableActions(b.bookingStatus, "studio", { shootDate: b.shootDate, today });
+          {shown.map(({ b, phase }) => {
+            const actions = availableActions(b.bookingStatus, "studio", { shootDate: b.shootDate, startTime: b.startTime, now });
             return (
               <li key={b.id} data-booking={b.id} className="rounded-xl border border-neutral-200 bg-white p-4 shadow-xs sm:p-5">
                 <div className="flex flex-wrap items-start justify-between gap-3">
@@ -85,7 +100,7 @@ export default async function StudioBookingsPage({ searchParams }: PageProps<"/d
                     <p className="font-semibold text-neutral-900">{b.customerName}</p>
                     <p className="text-sm text-neutral-600">{b.packageName}</p>
                   </div>
-                  <BookingStatusPill status={b.bookingStatus} />
+                  <BookingStatusPill status={b.bookingStatus} expired={phase === "expired"} />
                 </div>
                 <dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-3 text-sm sm:grid-cols-4">
                   <div>
@@ -115,8 +130,13 @@ export default async function StudioBookingsPage({ searchParams }: PageProps<"/d
                     {formatMoney(b.commissionAmount)} commission
                   </p>
                   <div className="flex flex-wrap items-center gap-3">
-                    {b.bookingStatus === "confirmed" && b.shootDate > today && (
-                      <p className="text-xs text-neutral-500">Can be marked completed from {formatDay(b.shootDate)}.</p>
+                    {b.bookingStatus === "confirmed" && phase === "upcoming" && (
+                      <p className="text-xs text-neutral-500">
+                        Can be marked completed from {formatDay(b.shootDate)}, {formatTime(b.startTime)}.
+                      </p>
+                    )}
+                    {phase === "expired" && (
+                      <p className="text-xs text-neutral-500">Expired — the requested time passed without a reply.</p>
                     )}
                     {actions.length > 0 && <BookingActions bookingId={b.id} actions={actions} />}
                   </div>

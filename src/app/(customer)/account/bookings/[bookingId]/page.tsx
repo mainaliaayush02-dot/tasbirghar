@@ -2,11 +2,11 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 
 import { BookingActions } from "@/components/bookings/booking-ui";
-import { BookingStatusPill, CUSTOMER_STATUS_COPY } from "@/components/bookings/booking-status";
+import { BookingStatusPill, customerCopy } from "@/components/bookings/booking-status";
 import { Alert, Card, PageHeader } from "@/components/ui/feedback";
 import { requireUser } from "@/lib/auth/current-user";
-import { nepalToday } from "@/lib/booking/rules";
-import { availableActions } from "@/lib/booking/transitions";
+import { nepalNowKey } from "@/lib/booking/rules";
+import { availableActions, bookingPhase } from "@/lib/booking/transitions";
 import { getCustomerBooking } from "@/lib/data/bookings";
 import { formatDate, formatDay, formatTimeRange } from "@/lib/format";
 import { formatMoney } from "@/lib/money";
@@ -18,17 +18,19 @@ export default async function BookingDetailPage({ params, searchParams }: PagePr
   const user = await requireUser("account", `/account/bookings/${bookingId}`);
   const booking = await getCustomerBooking(user.uid, bookingId);
   if (!booking) notFound();
-  // The "request sent" banner only while the request is still pending.
-  const created = (await searchParams).created === "1" && booking.bookingStatus === "pending";
-  const status = CUSTOMER_STATUS_COPY[booking.bookingStatus];
-  const actions = availableActions(booking.bookingStatus, "customer", { shootDate: booking.shootDate, today: nepalToday() });
+  const now = nepalNowKey();
+  const phase = bookingPhase(booking, now);
+  // The "request sent" banner only while the request is still open.
+  const created = (await searchParams).created === "1" && phase === "upcoming" && booking.bookingStatus === "pending";
+  const status = customerCopy(booking.bookingStatus, phase);
+  const actions = availableActions(booking.bookingStatus, "customer", { shootDate: booking.shootDate, startTime: booking.startTime, now });
 
   return (
     <main className="space-y-6">
       <Link href="/account/bookings" className="text-sm text-neutral-500 hover:text-neutral-900">
         ← My bookings
       </Link>
-      <PageHeader title={booking.studio.businessName} description={booking.packageName} actions={<BookingStatusPill status={booking.bookingStatus} />} />
+      <PageHeader title={booking.studio.businessName} description={booking.packageName} actions={<BookingStatusPill status={booking.bookingStatus} expired={phase === "expired"} />} />
 
       {created ? (
         <Alert tone="success" title="Booking request sent">
@@ -86,7 +88,7 @@ export default async function BookingDetailPage({ params, searchParams }: PagePr
             View studio
           </Link>
           {actions.length > 0 && <BookingActions bookingId={booking.id} actions={actions} />}
-          {booking.bookingStatus === "confirmed" && (
+          {booking.bookingStatus === "confirmed" && phase === "upcoming" && (
             <p className="text-sm text-neutral-500">
               Need to change or cancel a confirmed booking?{" "}
               <Link href="/contact" className="font-medium text-brand-700 hover:underline">Contact TasbirGhar</Link>

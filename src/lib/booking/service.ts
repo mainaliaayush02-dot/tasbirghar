@@ -28,7 +28,7 @@ import {
   fromMinutes,
   isRealDate,
   MAX_PENDING_PER_CUSTOMER,
-  nepalToday,
+  nepalNowKey,
   overlaps,
   monthDates,
   SLOT_STEP_MINUTES,
@@ -36,7 +36,7 @@ import {
   toMinutes,
   type Window,
 } from "./rules";
-import { checkTransition, type BookingAction } from "./transitions";
+import { checkTransition, isExpiredPending, type BookingAction } from "./transitions";
 
 /**
  * Server-authoritative booking logic.
@@ -51,6 +51,10 @@ import { checkTransition, type BookingAction } from "./transitions";
  * - Availability docs are written only here (setDayAvailability), under the
  *   same studio-day lock, and an edit that would leave a pending/confirmed
  *   booking outside the open hours is refused.
+ * - A customer's open (pending, not expired) requests are counted INSIDE the
+ *   booking transaction, which also reads and writes that customer's
+ *   `customerLocks/{uid}` doc, so concurrent requests from one customer are
+ *   serialized and can never exceed MAX_PENDING_PER_CUSTOMER.
  * - Every write for a studio-day first reads `bookingLocks/{studioId}_{date}`
  *   and writes it back. Firestore serializes transactions that touch the same
  *   document, so two concurrent requests can never both pass the overlap
@@ -60,6 +64,9 @@ import { checkTransition, type BookingAction } from "./transitions";
 const db = () => adminDb();
 const lockRef = (studioId: string, date: string) =>
   db().collection(collections.bookingLocks).doc(`${studioId}_${date}`);
+const customerLockRef = (uid: string) => db().collection(collections.customerLocks).doc(uid);
+const pendingOf = (uid: string) =>
+  db().collection(collections.bookings).where("customerId", "==", uid).where("bookingStatus", "==", "pending");
 const bookingsFor = (studioId: string, date: string) =>
   db().collection(collections.bookings).where("studioId", "==", studioId).where("shootDate", "==", date);
 
@@ -125,25 +132,16 @@ export async function createBooking(user: CurrentUser, input: BookingCreateInput
     throw new ApiError(422, "VALIDATION_FAILED", "Choose a start time on the half hour.", { startTime: "Invalid time." });
   }
 
-  const [studioSnap, internalSnap, packageSnap, pending] = await Promise.all([
+  const [studioSnap, internalSnap, packageSnap] = await Promise.all([
     studioRef(input.studioId).get(),
     studioInternalRef(input.studioId).get(),
     studioSub(input.studioId, "packages").doc(input.packageId).get(),
-    db()
-      .collection(collections.bookings)
-      .where("customerId", "==", user.uid)
-      .where("bookingStatus", "==", "pending")
-      .count()
-      .get(),
   ]);
   const studio = studioSnap.data() as StudioDoc | undefined;
   const internal = internalSnap.data() as StudioInternalDoc | undefined;
   if (!studio || !internal || studio.listingStatus !== "published") throw notFound("Studio");
   const pkg = packageSnap.data() as PackageDoc | undefined;
   if (!pkg || !pkg.isActive || pkg.studioId !== input.studioId) throw notFound("Package");
-  if (pending.data().count >= MAX_PENDING_PER_CUSTOMER) {
-    throw new ApiError(429, "TOO_MANY_PENDING", `You can have up to ${MAX_PENDING_PER_CUSTOMER} open booking requests at a time.`);
-  }
 
   const window: Window = {
     start: input.startTime,
@@ -159,13 +157,22 @@ export async function createBooking(user: CurrentUser, input: BookingCreateInput
 
   await db().runTransaction(async (tx) => {
     const lock = lockRef(input.studioId, input.shootDate);
-    const [, daySnap, existing, freshStudio] = await Promise.all([
+    const [, , daySnap, existing, freshStudio, pending] = await Promise.all([
       tx.get(lock),
+      tx.get(customerLockRef(user.uid)),
       tx.get(studioSub(input.studioId, "availability").doc(input.shootDate)),
       tx.get(bookingsFor(input.studioId, input.shootDate)),
       tx.get(studioRef(input.studioId)),
+      tx.get(pendingOf(user.uid)),
     ]);
     if (freshStudio.get("listingStatus") !== "published") throw notFound("Studio");
+
+    // Open requests only: expired ones (start time passed) no longer count.
+    const now = nepalNowKey();
+    const openRequests = pending.docs.filter((d) => !isExpiredPending(d.data() as BookingDoc, now)).length;
+    if (openRequests >= MAX_PENDING_PER_CUSTOMER) {
+      throw new ApiError(429, "TOO_MANY_PENDING", `You can have up to ${MAX_PENDING_PER_CUSTOMER} open booking requests at a time.`);
+    }
 
     const { isClosed, open } = openWindows(daySnap.data() as AvailabilityDayDoc | undefined);
     if (isClosed) throw new ApiError(409, "DAY_CLOSED", "The studio is not taking bookings on this date.");
@@ -210,6 +217,11 @@ export async function createBooking(user: CurrentUser, input: BookingCreateInput
       updatedAt: FieldValue.serverTimestamp(),
     });
     touchLock(tx, input.studioId, input.shootDate);
+    tx.set(
+      customerLockRef(user.uid),
+      { uid: user.uid, writes: FieldValue.increment(1), updatedAt: FieldValue.serverTimestamp() },
+      { merge: true },
+    );
   });
 
   return bookingRef.id;
@@ -227,7 +239,8 @@ function touchLock(tx: Transaction, studioId: string, date: string) {
 
 const TRANSITION_ERRORS = {
   INVALID_TRANSITION: (status: BookingStatus) => `This booking is ${status.replaceAll("_", " ")} and can't be changed that way.`,
-  NOT_YET: () => "A booking can be completed on or after the shoot date.",
+  NOT_YET: () => "A booking can be marked completed once its start time has passed.",
+  EXPIRED: () => "This request has expired — its requested time has already passed.",
 };
 
 /**
@@ -258,10 +271,11 @@ export async function transitionBooking(user: CurrentUser, bookingId: string, ac
       throw notFound("Booking");
     }
 
-    const check = checkTransition(b.bookingStatus, action, actor, { shootDate: b.shootDate, today: nepalToday() });
+    const check = checkTransition(b.bookingStatus, action, actor, { shootDate: b.shootDate, startTime: b.startTime, now: nepalNowKey() });
     if (!check.ok) {
       if (check.reason === "WRONG_ACTOR") throw forbidden();
       if (check.reason === "NOT_YET") throw new ApiError(409, "NOT_YET", TRANSITION_ERRORS.NOT_YET());
+      if (check.reason === "EXPIRED") throw new ApiError(409, "EXPIRED", TRANSITION_ERRORS.EXPIRED());
       throw new ApiError(409, "INVALID_TRANSITION", TRANSITION_ERRORS.INVALID_TRANSITION(b.bookingStatus));
     }
     const to = check.transition.to;

@@ -10,6 +10,8 @@ export const collections = {
   bookings: "bookings",
   /** Server-only per-studio-per-day lock docs that serialize booking writes. */
   bookingLocks: "bookingLocks",
+  /** Server-only per-customer lock docs that serialize a customer's new requests. */
+  customerLocks: "customerLocks",
   reviews: "reviews",
 } as const;
 

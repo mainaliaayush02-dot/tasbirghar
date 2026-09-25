@@ -3,6 +3,8 @@ import Link from "next/link";
 import { BOOKING_STATUS, PAYMENT_STATUS, pageParam, param, withParams } from "@/components/admin/status";
 import { AdminPageHeader, DataTable, EmptyState, FilterBar, Pagination, Panel, StatusPill } from "@/components/admin/ui";
 import { requireUser } from "@/lib/auth/current-user";
+import { nepalNowKey } from "@/lib/booking/rules";
+import { isExpiredPending } from "@/lib/booking/transitions";
 import { listBookingsAdmin, type AdminBookingRow } from "@/lib/data/admin";
 import { formatDate } from "@/lib/format";
 import { formatMoney } from "@/lib/money";
@@ -26,6 +28,7 @@ export default async function BookingsPage({ searchParams }: PageProps<"/admin/b
   const status = (Object.keys(BOOKING_STATUS) as BookingStatus[]).find((s) => s === param(sp, "status")) ?? "";
   const q = param(sp, "q");
   const result = await listBookingsAdmin({ status, q, page: pageParam(sp) });
+  const now = nepalNowKey();
 
   return (
     <>
@@ -87,7 +90,11 @@ export default async function BookingsPage({ searchParams }: PageProps<"/admin/b
                   header: "Status",
                   cell: (b) => (
                     <span className="flex flex-wrap gap-1">
-                      <StatusPill tone={BOOKING_STATUS[b.bookingStatus].tone}>{BOOKING_STATUS[b.bookingStatus].label}</StatusPill>
+                      {isExpiredPending(b, now) ? (
+                        <StatusPill tone="neutral">Expired</StatusPill>
+                      ) : (
+                        <StatusPill tone={BOOKING_STATUS[b.bookingStatus].tone}>{BOOKING_STATUS[b.bookingStatus].label}</StatusPill>
+                      )}
                       <StatusPill tone={PAYMENT_STATUS[b.paymentStatus].tone}>{PAYMENT_STATUS[b.paymentStatus].label}</StatusPill>
                     </span>
                   ),

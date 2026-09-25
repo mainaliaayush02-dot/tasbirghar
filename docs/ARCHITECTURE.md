@@ -170,6 +170,8 @@ studios/{studioId}/availability/{YYYY-MM-DD} AvailabilityDayDoc (one doc per day
 studioSlugs/{slug}                          { studioId }   (atomic slug uniqueness)
 bookings/{bookingId}                        BookingDoc
 reviews/{bookingId}                         ReviewDoc      (doc id = bookingId → one verified review per booking)
+bookingLocks/{studioId}_{YYYY-MM-DD}        server-only lock serializing a studio-day's booking/availability writes
+customerLocks/{uid}                         server-only lock serializing one customer's new requests (4B-1)
 ```
 
 The full types are in `src/types/models.ts`. Collection names are in `src/lib/firestore/paths.ts`.
@@ -352,11 +354,11 @@ The public header is **cookie-free**. The account area loads client-side from `G
 ### Booking architecture
 
 - **`POST /api/bookings`** is available to customer accounts only. The body carries intent only (studio, package, date, start time, contact, note); price, commission, payout, owner, end time and status are derived from Firestore, and the schema rejects them if sent.
-- **Rules** (`src/lib/booking/rules.ts`, shared by server and form): dates run from tomorrow to 180 days ahead in Asia/Kathmandu; start times fall on 30-minute steps; active (window-holding) statuses are `pending` and `confirmed`; a customer may hold at most 5 pending requests.
+- **Rules** (`src/lib/booking/rules.ts`, shared by server and form): dates run from tomorrow to 180 days ahead in Asia/Kathmandu; start times fall on 30-minute steps; active (window-holding) statuses are `pending` and `confirmed`; a customer may hold at most 5 open (pending, not expired) requests, counted inside the booking transaction (see section 6a).
 - **The transaction** (`src/lib/booking/service.ts`):
-  1. Read `bookingLocks/{studioId}_{date}`, the day's availability doc, all bookings for that studio-day, and the studio again.
+  1. Read `bookingLocks/{studioId}_{date}`, `customerLocks/{uid}`, the day's availability doc, all bookings for that studio-day, the studio again, and the customer's pending requests. Refuse with 429 if 5 of those are still open (not expired).
   2. Reject if the studio is no longer published, the day is closed, the window is outside the open hours (published slots, or the default 07:00–20:00), or it overlaps a blocking booking (`pending`, `confirmed` or `completed`).
-  3. Create the booking with `calculateCommission(packagePrice, internal.commissionRateBps ?? 800)` (read from `private/internal`, alongside the owner uid copied to `studioOwnerId`), then write the lock back.
+  3. Create the booking with `calculateCommission(packagePrice, internal.commissionRateBps ?? 800)` (read from `private/internal`, alongside the owner uid copied to `studioOwnerId`), then write both locks back.
   Because every booking write for a studio-day reads and writes the same lock document, Firestore serializes those transactions, so two concurrent requests can't both pass the overlap check. An API test fires 5 simultaneous requests for one slot and exactly one succeeds.
 - **Availability narrows, bookings decide.** A studio's availability can close a day or restrict it to custom slots, but existing bookings are always the final authority for conflicts (section 6a).
 - **Status changes, `POST /api/bookings/{id}`:** validated against the explicit transition table in `src/lib/booking/transitions.ts` (section 6a). Owners are verified against both `studioOwnerId` and the current `private/internal.ownerId`. Admins have no booking write path.
@@ -414,26 +416,32 @@ Studio → package → date → time → details → summary → submit (`/photo
 - **Blocking statuses** (`BLOCKING_BOOKING_STATUSES`): `pending`, `confirmed`, `completed`. No new request may overlap them. `declined`, `cancelled_by_customer` and `cancelled_by_studio` free the window immediately.
 - Every booking create, confirm, cancel, decline and availability edit for a studio-day reads and writes `bookingLocks/{studioId}_{date}` inside its transaction, so Firestore serializes them. Covered by API tests: two customers racing for one slot (exactly one wins), five racers (exactly one wins), and closing a day while a booking is being requested (exactly one of the two succeeds, never both).
 - Confirming re-checks overlaps under the lock.
+- **Open-request limit (Phase 4B-1).** A customer may hold at most 5 *open* requests (`pending` whose start time is still ahead). The count runs **inside** the booking transaction, which also reads and writes `customerLocks/{uid}` (server-only; rules deny all client access). Concurrent requests from one customer are therefore serialized. API test: 8 simultaneous requests from one customer create exactly 5, and a later burst creates none. Expired requests don't count.
 
 ### Status transitions (`src/lib/booking/transitions.ts`)
 
 | From | Action | Who | To |
 | --- | --- | --- | --- |
-| `pending` | `confirm` | studio | `confirmed` |
-| `pending` | `decline` | studio | `declined` |
-| `pending` | `cancel` | customer | `cancelled_by_customer` |
-| `confirmed` | `complete` (on or after the shoot date) | studio | `completed` |
-| `confirmed` | `studio_cancel` | studio | `cancelled_by_studio` |
+| `pending` | `confirm` (before the start time) | studio | `confirmed` |
+| `pending` | `decline` (before the start time) | studio | `declined` |
+| `pending` | `cancel` (before the start time) | customer | `cancelled_by_customer` |
+| `confirmed` | `complete` (once the start time has passed) | studio | `completed` |
+| `confirmed` | `studio_cancel` (any time) | studio | `cancelled_by_studio` |
 
-Everything else is refused: 409 for an invalid transition, 403 for the wrong actor, 404 for users unrelated to the booking. `completed`, `declined`, `cancelled_*` and `no_show` are final. The same table drives the buttons shown in the dashboards, and a unit test (`npm run test:unit`) checks every status × action × actor combination.
+Times are Nepal wall-clock (`nepalNowKey()` compared with `shootDate` + `startTime`). Everything else is refused: 409 for an invalid transition (`INVALID_TRANSITION`), for acting on an expired request (`EXPIRED`) or for completing too early (`NOT_YET`); 403 for the wrong actor; 404 for users unrelated to the booking.
+
+**Expired requests (derived, Phase 4B-1).** A `pending` request whose start time has passed is *expired*. That comes only from its date and time: there's no `expired` status, no stored change and no background job. It stays stored as `pending` (history is untouched), nobody can confirm, decline or cancel it, it no longer counts toward the open-request limit, and dashboards show it as "Expired". A studio can still `studio_cancel` a confirmed booking at any time, to close a session that never took place (`no_show` remains reserved and unused). `completed`, `declined`, `cancelled_*` and `no_show` are final. The same table drives the buttons shown in the dashboards, and a unit test (`npm run test:unit`) checks every status × action × actor combination.
 
 **Cancellation policy:** customers can cancel online **only while the request is pending**. Cancelling a *confirmed* booking needs a business policy (notice period, deposits or refunds once payments exist) that hasn't been decided, so for now the customer is pointed to TasbirGhar support and the studio can cancel a confirmed booking itself (`studio_cancel`). The studio has no reason field yet.
 
 ### Dashboards
 
-- `/dashboard/bookings`: tabs All / Pending / Confirmed / Completed / Cancelled / Declined, with cards showing booking ID, customer, package, date, time, amount, status, requested date, and the studio's own payout and commission (existing Phase 3 behavior). Actions: Confirm/Decline (pending), Mark completed (confirmed, from the shoot date) and Cancel booking (confirmed).
-- `/account/bookings`: Upcoming and History, each card with a plain-language status ("Booking confirmed", "Waiting for the studio"…), studio, package, date, time, price, booking ID and requested date. The detail page offers Cancel only while pending.
-- `/admin/bookings`: unchanged and read-only; adds filter tabs for "Cancelled by studio" and "Declined".
+Dashboards classify each booking by status **and** time (`bookingPhase` in `transitions.ts`): *upcoming* (pending or confirmed, start ahead), *needs completion* (confirmed, start passed), *expired* (pending, start passed) or *past* (final statuses).
+
+- `/dashboard/bookings`: tabs All / Pending (open requests only) / Confirmed / Completed / Cancelled / Declined / Expired, with cards showing booking ID, customer, package, date, time, amount, status, requested date, and the studio's own payout and commission (existing Phase 3 behavior). Actions come from the transition table: Confirm/Decline (open requests), Mark completed (confirmed, once started) and Cancel booking (confirmed). Sessions needing completion are listed first, under a "to mark completed" prompt.
+- `/dashboard`: a "Needs your attention" prompt counts open requests awaiting a reply and sessions to mark completed. These are derived from bookings; no reminder records are stored.
+- `/account/bookings`: *Upcoming* (open requests and confirmed sessions still ahead, soonest first) and *History* (everything else, including "Request expired" and "Session time has passed"). Each card has a plain-language status, studio, package, date, time, price, booking ID and requested date. The detail page offers Cancel only for an open request.
+- `/admin/bookings`: read-only; adds filter tabs for "Cancelled by studio" and "Declined", and labels expired requests "Expired".
 
 ### Permissions summary
 
@@ -450,7 +458,8 @@ Everything else is refused: 409 for an invalid transition, 403 for the wrong act
 - Standard hours are a fixed 7:00 AM – 8:00 PM for days without a custom schedule; there are no weekly templates or bulk edits yet (each date is set individually).
 - No notifications (email or SMS): customers and studios see changes when they open their pages.
 - There's no customer cancellation of confirmed bookings (see the policy note above) and no reason text on declines or studio cancellations.
-- `no_show` exists in the model but has no action yet.
+- `no_show` exists in the model but has no action yet (reserved).
+- Expired requests and sessions awaiting completion are surfaced as dashboard prompts only; there are no scheduled reminders, email or SMS.
 - `/dashboard/bookings` loads up to 300 bookings per studio in memory (fine at launch scale; paginate later).
 
 ---
@@ -520,7 +529,7 @@ Local values go in `.env.local`, which is gitignored. Production and preview val
 
 ### Firestore rules: what clients may do
 
-`firestore.rules` is deny-by-default and is covered by `tests/firestore-rules.test.mjs` (124 emulator tests). Client updates use **field allowlists**, so any field not listed is immutable from the client SDK.
+`firestore.rules` is deny-by-default and is covered by `tests/firestore-rules.test.mjs` (126 emulator tests). Client updates use **field allowlists**, so any field not listed is immutable from the client SDK.
 
 | Actor | Allowed | Everything else |
 | --- | --- | --- |

@@ -1309,7 +1309,8 @@ describe("Phase 4A: availability management and the booking lifecycle", () => {
     assert.equal(notYet.json.error.code, "NOT_YET");
 
     // A confirmed session happening today can be completed — once.
-    const today = await seedBooking({ shootDate: nepalToday(), bookingStatus: "confirmed", confirmedAt: new Date() });
+    // Starts at 00:00 so its start time has always passed (completion requires that since 4B-1).
+    const today = await seedBooking({ shootDate: nepalToday(), startTime: "00:00", endTime: "02:00", bookingStatus: "confirmed", confirmedAt: new Date() });
     const before = (await db.doc(`studios/${S.studioA}`).get()).get("stats.completedBookings") ?? 0;
     assert.equal((await act(S.alice, today, "complete")).status, 200);
     const done = (await db.doc(`bookings/${today}`).get()).data();
@@ -1381,6 +1382,129 @@ describe("Phase 4A: availability management and the booking lifecycle", () => {
     assert.equal(mine.status, 200);
     assert.match(mine.html, /Booking confirmed|Waiting for the studio|Request declined/);
     assert.equal((await page("/admin/bookings?status=cancelled_by_studio", S.admin2 ?? S.admin)).status, 200);
+  });
+});
+
+/* ======================================== 8c. Phase 4B-1: lifecycle hardening */
+
+describe("Phase 4B-1: booking lifecycle hardening", () => {
+  const book = (user, shootDate, startTime) =>
+    call(user, "POST", "/api/bookings", {
+      studioId: S.studioA, packageId: S.pkgA, shootDate, startTime,
+      customerName: "Lifecycle", customerPhone: "9811111177", customerNote: null,
+    });
+  const act = (user, bookingId, action) => call(user, "POST", `/api/bookings/${bookingId}`, { action });
+  const statusOf = async (id) => (await db.doc(`bookings/${id}`).get()).get("bookingStatus");
+  /** Nepal wall-clock "now" as YYYY-MM-DD / HH:mm. */
+  const nepalNow = () => {
+    const p = Object.fromEntries(new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kathmandu", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(new Date()).map((x) => [x.type, x.value]));
+    return { date: `${p.year}-${p.month}-${p.day}`, minutes: Number(p.hour) * 60 + Number(p.minute) };
+  };
+  const hhmm = (m) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+  /** Admin-SDK fixture: a booking in a state/time the public API can't create (e.g. a past start). */
+  const seed = async (customer, fields) => {
+    const ref = db.collection("bookings").doc();
+    await ref.set({
+      customerId: customer.uid, studioId: S.studioA, studioOwnerId: S.alice.uid, packageId: S.pkgA, photographyCategory: "newborn",
+      startTime: "10:00", endTime: "12:00", timezone: "Asia/Kathmandu", customerName: "Seeded", customerPhone: "+9779811111100",
+      customerNote: null, packageSnapshot: { name: "Seeded", price: 1500000, durationMinutes: 120 },
+      studioSnapshot: { businessName: "Seeded", slug: "seeded" }, paymentStatus: "unpaid", payoutStatus: "not_due", currency: "NPR",
+      grossAmount: 1500000, commissionRateBps: 800, commissionAmount: 120000, photographerNetAmount: 1380000,
+      confirmedAt: null, completedAt: null, cancelledAt: null, createdAt: new Date(), updatedAt: new Date(), ...fields,
+    });
+    return ref.id;
+  };
+
+  before(async () => {
+    [S.jay, S.kim, S.lee] = await Promise.all(
+      ["jay", "kim", "lee"].map((n) => login(`${n}-${RUN}@example.com`, { signup: true, profile: { displayName: n, phone: null } })),
+    );
+    assert.equal((await db.doc(`studios/${S.studioA}`).get()).get("listingStatus"), "published", "studio A is published");
+  });
+
+  test("a request whose start time has passed can't be confirmed, declined or cancelled (derived expiry)", async () => {
+    const today0000 = await seed(S.jay, { shootDate: nepalToday(), startTime: "00:00", endTime: "02:00", bookingStatus: "pending" });
+    const pastDay = await seed(S.jay, { shootDate: plusDays(-3), bookingStatus: "pending" });
+    for (const id of [today0000, pastDay]) {
+      for (const [user, action] of [[S.alice, "confirm"], [S.alice, "decline"], [S.jay, "cancel"]]) {
+        const res = await act(user, id, action);
+        assert.equal(res.status, 409, `${action} on expired`);
+        assert.equal(res.json.error.code, "EXPIRED");
+      }
+      assert.equal(await statusOf(id), "pending", "stored status is unchanged (expiry is derived)");
+    }
+    S.expiredJay = today0000;
+    // Still refused for the wrong actor with the right error.
+    assert.equal((await act(S.jay, today0000, "confirm")).status, 403);
+    // A request still in the future can be confirmed.
+    const future = await book(S.jay, plusDays(130), "09:00");
+    assert.equal(future.status, 201);
+    assert.equal((await act(S.alice, future.json.bookingId, "confirm")).status, 200);
+  });
+
+  test("completion requires the session's start time to have passed", async () => {
+    const now = nepalNow();
+    // Start ~1 hour from now (rolls to tomorrow near midnight — still in the future either way).
+    const startMin = Math.ceil((now.minutes + 60) / 30) * 30;
+    const later = startMin < 24 * 60 ? { shootDate: now.date, startTime: hhmm(startMin) } : { shootDate: plusDays(1), startTime: "00:30" };
+    const notYet = await seed(S.jay, { ...later, endTime: "23:59", bookingStatus: "confirmed", confirmedAt: new Date() });
+    const res = await act(S.alice, notYet, "complete");
+    assert.equal(res.status, 409);
+    assert.equal(res.json.error.code, "NOT_YET");
+    assert.equal(await statusOf(notYet), "confirmed");
+
+    const started = await seed(S.jay, { shootDate: nepalToday(), startTime: "00:00", endTime: "02:00", bookingStatus: "confirmed", confirmedAt: new Date() });
+    assert.equal((await act(S.jay, started, "complete")).status, 403, "customers can't complete");
+    assert.equal((await act(S.bob, started, "complete")).status, 404, "other studios can't complete");
+    assert.equal((await act(S.alice, started, "complete")).status, 200);
+    assert.equal(await statusOf(started), "completed");
+    S.needsCompletion = await seed(S.jay, { shootDate: plusDays(-1), bookingStatus: "confirmed", confirmedAt: new Date() });
+  });
+
+  test("expired requests don't count toward the 5 open-request limit", async () => {
+    for (let i = 0; i < 5; i++) await seed(S.kim, { shootDate: plusDays(-10 - i), bookingStatus: "pending" });
+    const results = [];
+    for (let i = 0; i < 6; i++) results.push((await book(S.kim, plusDays(140 + i), "09:00")).status);
+    assert.deepEqual(results, [201, 201, 201, 201, 201, 429]);
+  });
+
+  test("8 concurrent requests from one customer create at most 5 open requests", async () => {
+    const results = await Promise.all(Array.from({ length: 8 }, (_, i) => book(S.lee, plusDays(150 + i), "09:00")));
+    const statuses = results.map((r) => r.status).sort();
+    assert.deepEqual(statuses, [201, 201, 201, 201, 201, 429, 429, 429], JSON.stringify(results.map((r) => r.json?.error?.code ?? r.status)));
+    const pending = await db.collection("bookings").where("customerId", "==", S.lee.uid).where("bookingStatus", "==", "pending").get();
+    assert.equal(pending.size, 5, "exactly 5 open requests stored");
+    assert.ok((await db.doc(`customerLocks/${S.lee.uid}`).get()).exists, "customer lock written by the server");
+    // A second burst adds nothing.
+    const again = await Promise.all(Array.from({ length: 3 }, (_, i) => book(S.lee, plusDays(160 + i), "09:00")));
+    assert.deepEqual(again.map((r) => r.status), [429, 429, 429]);
+  });
+
+  test("dashboards classify bookings by status AND time", async () => {
+    // Customer: an expired request is history, never upcoming, and offers no cancel.
+    const list = await page("/account/bookings", S.jay);
+    assert.equal(list.status, 200);
+    const historyAt = list.html.indexOf('id="history"');
+    assert.ok(historyAt > 0, "history section");
+    assert.ok(list.html.indexOf(S.expiredJay) > historyAt, "expired request listed under History");
+    assert.match(list.html, /Request expired/);
+    const detail = await page(`/account/bookings/${S.expiredJay}?created=1`, S.jay);
+    assert.match(detail.html, /Request expired/);
+    assert.doesNotMatch(detail.html, /Booking request sent|>Cancel request</);
+
+    // Studio: expired requests leave the Pending tab and have no actions; sessions to complete are prompted.
+    const expiredTab = await page("/dashboard/bookings?status=expired", S.alice);
+    assert.ok(expiredTab.html.includes(S.expiredJay));
+    const pendingTab = await page("/dashboard/bookings?status=pending", S.alice);
+    assert.ok(!pendingTab.html.includes(S.expiredJay), "expired request not in Pending");
+    const all = await page("/dashboard/bookings", S.alice);
+    assert.match(all.html, /to mark completed/);
+    const card = all.html.slice(all.html.indexOf(`data-booking="${S.expiredJay}"`), all.html.indexOf(`data-booking="${S.expiredJay}"`) + 4000);
+    assert.doesNotMatch(card.split("</li>")[0], />(Confirm|Decline)</, "no actions on an expired request");
+    assert.match((await page("/dashboard", S.alice)).html, /Needs your attention/);
+
+    // Admin sees the derived label (read-only).
+    assert.match((await page("/admin/bookings", S.admin2 ?? S.admin)).html, />Expired</);
   });
 });
 

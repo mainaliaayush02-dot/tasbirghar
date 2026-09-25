@@ -967,3 +967,23 @@ describe("availability and booking integrity (Phase 4A)", () => {
     await assertFails(deleteDoc(ref(admin(), "bookings/b1")));
   });
 });
+
+/* ------------------------------------------------ lifecycle hardening (4B-1) */
+
+describe("customer booking locks are server-only (Phase 4B-1)", () => {
+  const lock = { uid: "alice", writes: 1 };
+  test("no client can read, create, edit or delete a customer lock (not even its own)", async () => {
+    for (const db of [anon(), customer("alice"), customerWithClaim("alice"), photographer("pa"), admin()]) {
+      await assertFails(getDoc(ref(db, "customerLocks/alice")));
+      await assertFails(setDoc(ref(db, "customerLocks/alice"), lock));
+      await assertFails(setDoc(ref(db, "customerLocks/bob"), { ...lock, uid: "bob" }));
+      await assertFails(deleteDoc(ref(db, "customerLocks/alice")));
+      await assertFails(getDocs(collection(db, "customerLocks")));
+    }
+  });
+  test("seeded lock docs stay unreadable and immutable from the client", async () => {
+    await env.withSecurityRulesDisabled((ctx) => setDoc(doc(ctx.firestore(), "customerLocks/alice"), lock));
+    await assertFails(getDoc(ref(customer("alice"), "customerLocks/alice")));
+    await assertFails(updateDoc(ref(customer("alice"), "customerLocks/alice"), { writes: 0 }));
+  });
+});

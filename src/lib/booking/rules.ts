@@ -36,6 +36,25 @@ export function nepalToday(now: Date = new Date()): string {
   return now.toLocaleDateString("en-CA", { timeZone: BOOKING_TZ });
 }
 
+const NOW_PARTS = new Intl.DateTimeFormat("en-CA", {
+  timeZone: BOOKING_TZ,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
+
+/**
+ * The current Nepal wall-clock minute as a sortable "YYYY-MM-DDTHH:mm" key,
+ * comparable with `startKey(booking)`.
+ */
+export function nepalNowKey(now: Date = new Date()): string {
+  const p = Object.fromEntries(NOW_PARTS.formatToParts(now).map((x) => [x.type, x.value]));
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}`;
+}
+
 export function addDays(date: string, days: number): string {
   const d = new Date(`${date}T00:00:00Z`);
   d.setUTCDate(d.getUTCDate() + days);
