@@ -11,7 +11,7 @@ rules_version = '2';
 //   may only ever create it as "customer" and can never change it.
 // - Sensitive writes happen server-side (Admin SDK bypasses these rules):
 //   studio creation (slug reservation, commission, private sub-documents),
-//   studio contact details, moderation, bookings,
+//   studio contact details, availability, moderation, bookings,
 //   reviews, and every MediaAsset field (written by the media confirm step
 //   after verifying the asset with Cloudinary).
 // - Admins are READ-ONLY here. Admin mutations go through server routes so
@@ -145,18 +145,16 @@ service cloud.firestore {
         allow delete: if ownsStudio(studioId);
       }
 
-      // One doc per day, id = "YYYY-MM-DD". Booking code must re-validate
-      // slots server-side; owner-edited slot statuses are never trusted.
+      // One doc per day, id = "YYYY-MM-DD". Written ONLY by the server
+      // (PUT/DELETE /api/studios/{id}/availability/{date}), which validates
+      // the slots (30-minute steps, no overlaps, bookable dates) and edits
+      // under the studio-day booking lock, refusing changes that would strand
+      // a pending/confirmed booking. Rules cannot express those checks, so
+      // direct client writes are closed. Existing bookings stay the final
+      // authority for conflicts either way.
       match /availability/{date} {
         allow read: if canReadStudioContent(studioId);
-        allow create: if ownsStudio(studioId)
-          && incoming().keys().hasOnly(['studioId', 'date', 'isClosed', 'slots',
-                                        'createdAt', 'updatedAt'])
-          && incoming().studioId == studioId
-          && incoming().date == date;
-        allow update: if ownsStudio(studioId)
-          && onlyChanges(['isClosed', 'slots', 'updatedAt']);
-        allow delete: if ownsStudio(studioId);
+        allow write: if false;
       }
     }
 

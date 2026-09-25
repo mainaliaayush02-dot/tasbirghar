@@ -915,9 +915,14 @@ describe("booking creation (server-authoritative)", () => {
     const adjacent = await book(S.erin, { startTime: endTime });
     assert.equal(adjacent.status, 201, JSON.stringify(adjacent.json));
     S.bookingErin = adjacent.json.bookingId;
+    // The public day view exposes published hours only — never booking data.
     const day = await call(null, "GET", `/api/studios/${S.studioA}/availability?date=${plusDays(14)}`);
     assert.equal(day.status, 200);
-    assert.equal(day.json.busy.length, 2);
+    assert.deepEqual(Object.keys(day.json).sort(), ["date", "isClosed", "open", "source"]);
+    const body = JSON.stringify(day.json);
+    for (const secret of [S.bookingDave, S.bookingErin, "Dev Customer", "9811111111", S.alice.uid, "pending", "busy", "commission"]) {
+      assert.ok(!body.includes(secret), `public day view leaks ${secret}`);
+    }
   });
 
   test("concurrent requests for the same slot: exactly one succeeds", async () => {
@@ -1011,6 +1016,371 @@ describe("booking transitions and customer pages", () => {
     const me = await call(S.dave, "GET", "/api/auth/session");
     assert.deepEqual(Object.keys(me.json.user).sort(), ["displayName", "home", "role"]);
     assert.equal(me.json.user.role, "customer");
+  });
+});
+
+/* ================================================= 8b. Phase 4A: availability */
+
+describe("Phase 4A: availability management and the booking lifecycle", () => {
+  const av = (user, date, body, method = "PUT", studioId = S.studioA) =>
+    call(user, method, `/api/studios/${studioId}/availability/${date}`, body);
+  const month = (date, packageId = S.pkgA, studioId = S.studioA) =>
+    call(null, "GET", `/api/studios/${studioId}/availability?month=${date.slice(0, 7)}&packageId=${packageId}`);
+  const slot = (start, end) => ({ start, end });
+  const book = (user, shootDate, startTime, extra = {}) =>
+    call(user, "POST", "/api/bookings", {
+      studioId: S.studioA, packageId: S.pkgA, shootDate, startTime,
+      customerName: "Phase Four", customerPhone: "9811111199", customerNote: null, ...extra,
+    });
+  const act = (user, bookingId, action) => call(user, "POST", `/api/bookings/${bookingId}`, { action });
+  const status = async (id) => (await db.doc(`bookings/${id}`).get()).get("bookingStatus");
+  /** Test fixture written with the Admin SDK: a booking in a state the public API can't reach yet (e.g. a past shoot date). */
+  const seedBooking = async (fields) => {
+    const ref = db.collection("bookings").doc();
+    await ref.set({
+      customerId: S.fay.uid, studioId: S.studioA, studioOwnerId: S.alice.uid, packageId: S.pkgA, photographyCategory: "newborn",
+      startTime: "10:00", endTime: "12:00", timezone: "Asia/Kathmandu", customerName: "Seeded", customerPhone: "+9779811111100",
+      customerNote: null, packageSnapshot: { name: "Seeded", price: 1500000, durationMinutes: 120 },
+      studioSnapshot: { businessName: "Seeded", slug: "seeded" }, paymentStatus: "unpaid", payoutStatus: "not_due", currency: "NPR",
+      grossAmount: 1500000, commissionRateBps: 800, commissionAmount: 120000, photographerNetAmount: 1380000,
+      confirmedAt: null, completedAt: null, cancelledAt: null, createdAt: new Date(), updatedAt: new Date(), ...fields,
+    });
+    return ref.id;
+  };
+
+  before(async () => {
+    // Studio A was suspended by the previous suite: reinstate + publish again.
+    const admin = S.admin2 ?? S.admin;
+    assert.equal((await call(admin, "POST", `/api/admin/studios/${S.studioA}`, { action: "reinstate", reason: null })).status, 200);
+    assert.equal((await call(admin, "POST", `/api/admin/studios/${S.studioA}`, { action: "publish", reason: null })).status, 200);
+    assert.equal(S.pkgADuration, 120, "fixture package is 2 hours");
+    [S.fay, S.gus, S.hal, S.ivy] = await Promise.all(
+      ["fay", "gus", "hal", "ivy"].map((n) => login(`${n}-${RUN}@example.com`, { signup: true, profile: { displayName: n, phone: null } })),
+    );
+  });
+
+  test("owner sets custom slots; the public month view offers only free start times, nothing else", async () => {
+    const d = plusDays(90);
+    const res = await av(S.alice, d, { isClosed: false, slots: [slot("14:00", "16:00"), slot("10:00", "12:00")] });
+    assert.equal(res.status, 200, JSON.stringify(res.json));
+    assert.equal(res.json.mode, "custom");
+    const doc = (await db.doc(`studios/${S.studioA}/availability/${d}`).get()).data();
+    assert.deepEqual(doc.slots.map((s) => `${s.start}-${s.end}`), ["10:00-12:00", "14:00-16:00"], "stored sorted");
+    assert.equal(doc.studioId, S.studioA);
+    assert.equal(doc.date, d);
+
+    const view = await month(d);
+    assert.equal(view.status, 200);
+    assert.deepEqual(Object.keys(view.json).sort(), ["days", "month"]);
+    assert.deepEqual(view.json.days[d], ["10:00", "14:00"]);
+  });
+
+  test("owner edits and deletes slots, and resets a day to standard hours", async () => {
+    const d = plusDays(90);
+    assert.equal((await av(S.alice, d, { isClosed: false, slots: [slot("09:00", "12:00")] })).status, 200);
+    assert.deepEqual((await month(d)).json.days[d], ["09:00", "09:30", "10:00"]);
+    const reset = await av(S.alice, d, undefined, "DELETE");
+    assert.equal(reset.status, 200);
+    assert.equal(reset.json.mode, "standard");
+    assert.equal((await db.doc(`studios/${S.studioA}/availability/${d}`).get()).exists, false);
+    assert.equal((await month(d)).json.days[d][0], "07:00", "standard hours again");
+    const closed = await av(S.alice, d, { isClosed: true, slots: [] });
+    assert.equal(closed.json.mode, "closed");
+    assert.equal((await month(d)).json.days[d], undefined, "closed day is not offered");
+  });
+
+  test("invalid availability input is rejected server-side", async () => {
+    const d = plusDays(91);
+    for (const [label, body] of [
+      ["end before start", { isClosed: false, slots: [slot("11:00", "10:00")] }],
+      ["zero length", { isClosed: false, slots: [slot("10:00", "10:00")] }],
+      ["overlapping", { isClosed: false, slots: [slot("10:00", "12:00"), slot("11:30", "13:00")] }],
+      ["duplicate", { isClosed: false, slots: [slot("10:00", "11:00"), slot("10:00", "11:00")] }],
+      ["off the 30-minute step", { isClosed: false, slots: [slot("10:15", "11:00")] }],
+      ["malformed time", { isClosed: false, slots: [slot("9:00", "11:00")] }],
+      ["hour 24", { isClosed: false, slots: [slot("23:00", "24:00")] }],
+      ["no slots on an open custom day", { isClosed: false, slots: [] }],
+      ["slots on a closed day", { isClosed: true, slots: [slot("10:00", "11:00")] }],
+      ["too many slots", { isClosed: false, slots: Array.from({ length: 13 }, (_, i) => slot(`${String(6 + i).padStart(2, "0")}:00`, `${String(6 + i).padStart(2, "0")}:30`)) }],
+      ["extra slot fields", { isClosed: false, slots: [{ start: "10:00", end: "11:00", status: "booked" }] }],
+      ["smuggled booking id", { isClosed: false, slots: [{ start: "10:00", end: "11:00", bookingId: "x" }] }],
+      ["extra body fields", { isClosed: false, slots: [slot("10:00", "11:00")], studioId: S.studioB }],
+      ["missing isClosed", { slots: [slot("10:00", "11:00")] }],
+      ["slots not a list", { isClosed: false, slots: "10:00-11:00" }],
+    ]) {
+      assert.equal((await av(S.alice, d, body)).status, 422, label);
+    }
+    for (const date of [nepalToday(), plusDays(-3), plusDays(181), "2026-02-30", "2026-13-01", "tomorrow"]) {
+      const res = await av(S.alice, date, { isClosed: true, slots: [] });
+      assert.equal(res.status, 422, `date ${date}`);
+    }
+    assert.equal((await db.doc(`studios/${S.studioA}/availability/${d}`).get()).exists, false, "nothing was written");
+  });
+
+  test("only the studio owner can manage its availability", async () => {
+    const d = plusDays(92);
+    const body = { isClosed: true, slots: [] };
+    assert.equal((await av(null, d, body)).status, 401, "signed out");
+    assert.equal((await av(S.dave, d, body)).status, 403, "customer");
+    assert.equal((await av(S.admin2 ?? S.admin, d, body)).status, 403, "admin has no owner write path");
+    assert.equal((await av(S.bob, d, body)).status, 403, "other photographer");
+    assert.equal((await av(S.bob, d, undefined, "DELETE")).status, 403, "other photographer delete");
+    assert.equal((await av(S.alice, d, body, "PUT", "no-such-studio")).status, 404, "nonexistent studio");
+    assert.equal((await av(S.alice, d, body, "PUT", S.studioB)).status, 403, "A on B's studio");
+    const noOrigin = await call(S.alice, "PUT", `/api/studios/${S.studioA}/availability/${d}`, body, { Origin: "https://evil.example" });
+    assert.equal(noOrigin.status, 403, "cross-origin");
+    assert.equal((await db.doc(`studios/${S.studioA}/availability/${d}`).get()).exists, false);
+    // Bob can manage his OWN studio's schedule (even while it is a draft).
+    assert.equal((await av(S.bob, d, body, "PUT", S.studioB)).status, 200);
+  });
+
+  test("month view: validation and visibility", async () => {
+    const d = plusDays(92);
+    assert.equal((await call(null, "GET", `/api/studios/${S.studioA}/availability?month=2026-13&packageId=${S.pkgA}`)).status, 422);
+    assert.equal((await call(null, "GET", `/api/studios/${S.studioA}/availability?month=${d.slice(0, 7)}`)).status, 404, "package required");
+    assert.equal((await month(d, "nope")).status, 404);
+    assert.equal((await month(d, S.pkgA, S.studioB)).status, 404, "draft studio");
+  });
+
+  test("bookings against an unavailable date or time are refused", async () => {
+    const closed = plusDays(93);
+    const custom = plusDays(94);
+    assert.equal((await av(S.alice, closed, { isClosed: true, slots: [] })).status, 200);
+    assert.equal((await av(S.alice, custom, { isClosed: false, slots: [slot("10:00", "12:00")] })).status, 200);
+    const onClosed = await book(S.fay, closed, "10:00");
+    assert.equal(onClosed.status, 409);
+    assert.equal(onClosed.json.error.code, "DAY_CLOSED");
+    const outside = await book(S.fay, custom, "14:00");
+    assert.equal(outside.status, 409);
+    assert.equal(outside.json.error.code, "OUTSIDE_HOURS");
+    assert.equal((await book(S.fay, custom, "11:00")).status, 409, "2h session does not fit 11:00-12:00");
+    const ok = await book(S.fay, custom, "10:00");
+    assert.equal(ok.status, 201, JSON.stringify(ok.json));
+    S.p4Custom = ok.json.bookingId;
+    assert.deepEqual((await month(custom)).json.days[custom], undefined, "fully booked day disappears");
+  });
+
+  test("availability edits can never strand a pending or confirmed booking", async () => {
+    const d = plusDays(94); // Fay's pending 10:00-12:00
+    for (const [label, body] of [
+      ["close the day", { isClosed: true, slots: [] }],
+      ["move the slot", { isClosed: false, slots: [slot("14:00", "16:00")] }],
+      ["shrink the slot", { isClosed: false, slots: [slot("10:00", "11:00")] }],
+    ]) {
+      const res = await av(S.alice, d, body);
+      assert.equal(res.status, 409, label);
+      assert.equal(res.json.error.code, "BOOKED_TIME");
+    }
+    // Widening is fine, and standard hours (07:00-20:00) still cover it.
+    assert.equal((await av(S.alice, d, { isClosed: false, slots: [slot("09:00", "13:00")] })).status, 200);
+    assert.equal((await av(S.alice, d, undefined, "DELETE")).status, 200);
+    assert.equal((await act(S.alice, S.p4Custom, "confirm")).status, 200);
+    assert.equal((await av(S.alice, d, { isClosed: true, slots: [] })).status, 409, "confirmed booking protected too");
+  });
+
+  test("scenario B/C: pending and confirmed bookings block the slot", async () => {
+    const d = plusDays(95);
+    const first = await book(S.fay, d, "10:00");
+    assert.equal(first.status, 201);
+    assert.equal((await book(S.gus, d, "10:00")).status, 409, "pending blocks same time");
+    assert.equal((await book(S.gus, d, "11:00")).status, 409, "pending blocks overlap");
+    assert.equal((await act(S.alice, first.json.bookingId, "confirm")).status, 200);
+    const again = await book(S.gus, d, "10:00");
+    assert.equal(again.status, 409, "confirmed blocks same time");
+    assert.equal(again.json.error.code, "SLOT_TAKEN");
+    assert.equal((await book(S.gus, d, "09:00")).status, 409, "confirmed blocks overlap");
+    assert.equal((await book(S.gus, d, "12:00")).status, 201, "adjacent is free");
+  });
+
+  test("public availability APIs expose only free times / published hours — no booking, customer or studio-private data", async () => {
+    const d = plusDays(95); // has a confirmed (Fay 10:00) and a pending (Gus 12:00) booking
+    const bookings = (await db.collection("bookings").where("studioId", "==", S.studioA).where("shootDate", "==", d).get()).docs;
+    assert.ok(bookings.length >= 2, "fixture: bookings exist on this day");
+    const contact = (await db.doc(`studios/${S.studioA}/private/contact`).get()).data();
+    const needles = [
+      ...bookings.map((b) => b.id),
+      ...bookings.flatMap((b) => [b.get("customerName"), b.get("customerPhone"), b.get("customerId")]),
+      S.alice.uid, contact.phone, contact.email, contact.address, contact.website, contact.instagram,
+      "busy", "pending", "confirmed", "completed", "bookingStatus", "customer", "commission", "photographerNet",
+      "grossAmount", "ownerId", "lastModeration", "moderation",
+    ].filter(Boolean).map(String);
+
+    const dayView = await call(null, "GET", `/api/studios/${S.studioA}/availability?date=${d}`);
+    assert.equal(dayView.status, 200);
+    assert.deepEqual(Object.keys(dayView.json).sort(), ["date", "isClosed", "open", "source"]);
+    for (const w of dayView.json.open) assert.deepEqual(Object.keys(w).sort(), ["end", "start"]);
+
+    const monthView = await month(d);
+    assert.equal(monthView.status, 200);
+    assert.deepEqual(Object.keys(monthView.json).sort(), ["days", "month"]);
+    for (const times of Object.values(monthView.json.days)) {
+      assert.ok(Array.isArray(times) && times.every((t) => /^\d\d:\d\d$/.test(t)), "only HH:mm strings");
+    }
+    assert.ok(!(monthView.json.days[d] ?? []).includes("10:00"), "booked time is not offered");
+
+    for (const [label, json] of [["?date=", dayView.json], ["?month=", monthView.json]]) {
+      const body = JSON.stringify(json);
+      for (const n of needles) assert.ok(!body.includes(n), `${label} leaks ${n}`);
+    }
+  });
+
+  test("scenario D: cancelled, declined and studio-cancelled bookings free the slot", async () => {
+    const d = plusDays(96);
+    const a = await book(S.hal, d, "10:00");
+    assert.equal((await act(S.hal, a.json.bookingId, "cancel")).status, 200);
+    const b = await book(S.ivy, d, "10:00");
+    assert.equal(b.status, 201, "free again after customer cancel");
+    assert.equal((await act(S.alice, b.json.bookingId, "decline")).status, 200);
+    const c = await book(S.hal, d, "10:00");
+    assert.equal(c.status, 201, "free again after decline");
+    assert.equal((await act(S.alice, c.json.bookingId, "confirm")).status, 200);
+    assert.equal((await act(S.alice, c.json.bookingId, "studio_cancel")).status, 200);
+    assert.equal(await status(c.json.bookingId), "cancelled_by_studio");
+    assert.ok((await db.doc(`bookings/${c.json.bookingId}`).get()).get("cancelledAt"));
+    assert.equal((await book(S.ivy, d, "10:00")).status, 201, "free again after studio cancel");
+  });
+
+  test("scenario E: a completed booking blocks its slot but not other dates; past dates can't be booked", async () => {
+    const d = plusDays(97);
+    await seedBooking({ shootDate: d, bookingStatus: "completed", completedAt: new Date() });
+    const same = await book(S.gus, d, "10:00");
+    assert.equal(same.status, 409, "completed window stays blocked");
+    assert.equal((await book(S.gus, d, "11:00")).status, 409);
+    assert.equal((await book(S.gus, plusDays(98), "10:00")).status, 201, "a future date is not blocked");
+    assert.equal((await book(S.gus, plusDays(-2), "10:00")).status, 422, "historical date");
+  });
+
+  test("scenario A: two customers racing for the same slot — exactly one wins", async () => {
+    const d = plusDays(99);
+    const results = await Promise.all([book(S.fay, d, "15:00"), book(S.ivy, d, "15:00")]);
+    assert.deepEqual(results.map((r) => r.status).sort(), [201, 409], JSON.stringify(results.map((r) => r.json)));
+    const snap = await db.collection("bookings").where("studioId", "==", S.studioA).where("shootDate", "==", d).get();
+    assert.equal(snap.size, 1);
+  });
+
+  test("race: closing a day while a booking is requested never leaves both in effect", async () => {
+    for (const n of [100, 101, 102]) {
+      const d = plusDays(n);
+      const [close, req] = await Promise.all([av(S.alice, d, { isClosed: true, slots: [] }), book(S.hal, d, "10:00")]);
+      const closed = (await db.doc(`studios/${S.studioA}/availability/${d}`).get()).get("isClosed") === true;
+      const active = (await db.collection("bookings").where("studioId", "==", S.studioA).where("shootDate", "==", d).get()).docs
+        .filter((b) => ["pending", "confirmed"].includes(b.get("bookingStatus")));
+      assert.ok(!(closed && active.length), `day ${d}: closed=${closed} active=${active.length} (PUT ${close.status}, POST ${req.status})`);
+      assert.ok((close.status === 200) !== (req.status === 201), `exactly one wins: PUT ${close.status}, POST ${req.status}`);
+      if (req.status === 201) await act(S.hal, req.json.bookingId, "cancel");
+    }
+  });
+
+  test("race: moving a slot while a booking inside the old slot is requested never leaves an invalid booking", async () => {
+    for (const n of [110, 111, 112]) {
+      const d = plusDays(n);
+      assert.equal((await av(S.alice, d, { isClosed: false, slots: [slot("10:00", "12:00")] })).status, 200);
+      const [move, req] = await Promise.all([
+        av(S.alice, d, { isClosed: false, slots: [slot("14:00", "16:00")] }),
+        book(S.ivy, d, "10:00"),
+      ]);
+      assert.ok((move.status === 200) !== (req.status === 201), `exactly one wins: PUT ${move.status}, POST ${req.status}`);
+      if (move.status !== 200) assert.equal(move.json.error.code, "BOOKED_TIME");
+      if (req.status !== 201) assert.equal(req.status, 409);
+      // Every active booking lies inside the day's current open slots.
+      const slots = (await db.doc(`studios/${S.studioA}/availability/${d}`).get()).get("slots");
+      const active = (await db.collection("bookings").where("studioId", "==", S.studioA).where("shootDate", "==", d).get()).docs
+        .filter((b) => ["pending", "confirmed"].includes(b.get("bookingStatus")));
+      for (const b of active) {
+        assert.ok(slots.some((s) => s.start <= b.get("startTime") && b.get("endTime") <= s.end), `booking ${b.get("startTime")} outside ${JSON.stringify(slots)}`);
+      }
+      if (req.status === 201) await act(S.ivy, req.json.bookingId, "cancel");
+    }
+  });
+
+  test("studio transitions: valid ones succeed, invalid ones are refused", async () => {
+    const d = plusDays(103);
+    const p = (await book(S.fay, d, "09:00")).json.bookingId;
+    assert.equal((await act(S.alice, p, "complete")).status, 409, "pending → completed");
+    assert.equal((await act(S.alice, p, "studio_cancel")).status, 409, "pending → studio cancel (use decline)");
+    assert.equal((await act(S.alice, p, "cancel")).status, 403, "studio cannot use the customer's cancel");
+    assert.equal((await act(S.bob, p, "confirm")).status, 404, "other photographer");
+    assert.equal((await act(S.admin2 ?? S.admin, p, "confirm")).status, 403, "admin has no booking write path");
+    assert.equal((await act(S.alice, p, "confirm")).status, 200);
+    assert.equal((await act(S.alice, p, "confirm")).status, 409, "confirmed → confirmed");
+    assert.equal((await act(S.alice, p, "decline")).status, 409, "confirmed → declined");
+    const notYet = await act(S.alice, p, "complete");
+    assert.equal(notYet.status, 409, "before the shoot date");
+    assert.equal(notYet.json.error.code, "NOT_YET");
+
+    // A confirmed session happening today can be completed — once.
+    const today = await seedBooking({ shootDate: nepalToday(), bookingStatus: "confirmed", confirmedAt: new Date() });
+    const before = (await db.doc(`studios/${S.studioA}`).get()).get("stats.completedBookings") ?? 0;
+    assert.equal((await act(S.alice, today, "complete")).status, 200);
+    const done = (await db.doc(`bookings/${today}`).get()).data();
+    assert.equal(done.bookingStatus, "completed");
+    assert.equal(done.payoutStatus, "pending");
+    assert.ok(done.completedAt);
+    assert.equal((await db.doc(`studios/${S.studioA}`).get()).get("stats.completedBookings"), before + 1);
+    for (const action of ["complete", "confirm", "decline", "studio_cancel"]) {
+      assert.equal((await act(S.alice, today, action)).status, 409, `completed → ${action}`);
+    }
+    assert.equal((await act(S.fay, today, "cancel")).status, 409, "customer cannot cancel a completed booking");
+  });
+
+  test("customer cancellation: only their own pending request", async () => {
+    const d = plusDays(104);
+    const p = (await book(S.gus, d, "09:00")).json.bookingId;
+    assert.equal((await act(S.fay, p, "cancel")).status, 404, "someone else's booking");
+    assert.equal((await act(S.gus, p, "cancel")).status, 200);
+    assert.equal(await status(p), "cancelled_by_customer");
+    assert.equal((await act(S.gus, p, "cancel")).status, 409, "cancelled → cancelled");
+
+    const c = (await book(S.gus, d, "13:00")).json.bookingId;
+    assert.equal((await act(S.alice, c, "confirm")).status, 200);
+    assert.equal((await act(S.gus, c, "cancel")).status, 409, "confirmed bookings are not cancellable online (no policy yet)");
+    const dec = (await book(S.gus, d, "16:00")).json.bookingId;
+    assert.equal((await act(S.alice, dec, "decline")).status, 200);
+    assert.equal((await act(S.gus, dec, "cancel")).status, 409, "declined → cancelled");
+  });
+
+  test("customers cannot change status or tamper with the booking through the API", async () => {
+    const p = (await book(S.ivy, plusDays(105), "09:00")).json.bookingId;
+    for (const action of ["confirm", "decline", "complete", "studio_cancel"]) {
+      assert.equal((await act(S.ivy, p, action)).status, 403, action);
+    }
+    for (const body of [
+      { action: "cancelled" },
+      { action: "cancel", bookingStatus: "confirmed" },
+      { bookingStatus: "confirmed" },
+      { action: "confirm", grossAmount: 1 },
+    ]) {
+      assert.equal((await call(S.ivy, "POST", `/api/bookings/${p}`, body)).status, 422, JSON.stringify(body));
+    }
+    assert.equal(await status(p), "pending");
+    for (const extra of [
+      { studioOwnerId: S.ivy.uid }, { photographerNetAmount: 1 }, { commissionAmount: 0 }, { commissionRateBps: 0 },
+      { startingPrice: 1 }, { role: "admin" }, { bookingStatus: "confirmed" }, { grossAmount: 100 },
+    ]) {
+      assert.equal((await book(S.ivy, plusDays(106), "09:00", extra)).status, 422, JSON.stringify(extra));
+    }
+    const priced = await book(S.ivy, plusDays(106), "09:00");
+    assert.equal(priced.status, 201);
+    const b = (await db.doc(`bookings/${priced.json.bookingId}`).get()).data();
+    assert.equal(b.grossAmount, S.pkgAPrice, "price from Firestore");
+    assert.equal(b.studioOwnerId, S.alice.uid, "owner from private/internal");
+    assert.equal(b.commissionAmount + b.photographerNetAmount, b.grossAmount);
+  });
+
+  test("dashboard and account pages render for their owners only", async () => {
+    assert.equal((await page("/dashboard/availability", S.alice)).status, 200);
+    const cal = await page(`/dashboard/availability?month=${plusDays(94).slice(0, 7)}&date=${plusDays(94)}`, S.alice);
+    assert.equal(cal.status, 200);
+    assert.match(cal.html, /Save availability|Availability can be changed/);
+    assert.equal((await page("/dashboard/availability?month=1999-01&date=nonsense", S.alice)).status, 200, "bad params are clamped");
+    assert.equal((await page("/dashboard/availability", S.dave)).status, 307, "customer is redirected");
+    for (const tab of ["", "?status=pending", "?status=confirmed", "?status=completed", "?status=cancelled", "?status=declined", "?status=bogus"]) {
+      assert.equal((await page(`/dashboard/bookings${tab}`, S.alice)).status, 200, tab);
+    }
+    const mine = await page("/account/bookings", S.gus);
+    assert.equal(mine.status, 200);
+    assert.match(mine.html, /Booking confirmed|Waiting for the studio|Request declined/);
+    assert.equal((await page("/admin/bookings?status=cancelled_by_studio", S.admin2 ?? S.admin)).status, 200);
   });
 });
 

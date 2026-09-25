@@ -11,7 +11,7 @@ const NAV = [
   { href: "/dashboard/gallery", label: "Studio photos" },
   { href: "/dashboard/packages", label: "Packages" },
   { href: "/dashboard/bookings", label: "Bookings" },
-  { href: "/dashboard/availability", label: "Availability", soon: true },
+  { href: "/dashboard/availability", label: "Availability" },
   { href: "/dashboard/verification", label: "Verification" },
   { href: "/account", label: "Account" },
 ] as const;
@@ -36,9 +36,6 @@ function NavLinks({ onNavigate }: { onNavigate?: () => void }) {
               }`}
             >
               {item.label}
-              {"soon" in item && (
-                <span className="text-[10px] tracking-wide text-neutral-400 uppercase">Soon</span>
-              )}
             </Link>
           </li>
         );

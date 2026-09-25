@@ -1,19 +1,97 @@
+import Link from "next/link";
+
+import { AvailabilityCalendar, LEGEND } from "@/components/availability/calendar";
+import { DayEditor } from "@/components/availability/day-editor";
+import { buttonClass } from "@/components/ui/button";
 import { Card, PageHeader } from "@/components/ui/feedback";
+import { addMonths, bookableRange, isRealDate, MONTH_RE, nepalToday } from "@/lib/booking/rules";
+import { getStudioCalendar } from "@/lib/booking/service";
 import { requireStudio } from "@/lib/data/dashboard";
+import { listPackages } from "@/lib/data/studios";
 
 export const metadata = { title: "Availability" };
 
-export default async function AvailabilityPage() {
-  await requireStudio("/dashboard/availability");
+export default async function AvailabilityPage({ searchParams }: PageProps<"/dashboard/availability">) {
+  const { studio } = await requireStudio("/dashboard/availability");
+  const sp = await searchParams;
+  const today = nepalToday();
+  const thisMonth = today.slice(0, 7);
+  const { min, max } = bookableRange();
+
+  // Month: requested (clamped to 1 month back … the last bookable month).
+  const requested = typeof sp.month === "string" && MONTH_RE.test(sp.month) ? sp.month : thisMonth;
+  const month = requested < addMonths(thisMonth, -1) ? addMonths(thisMonth, -1) : requested > max.slice(0, 7) ? max.slice(0, 7) : requested;
+
+  const [days, packages] = await Promise.all([getStudioCalendar(studio.id, month), listPackages(studio.id)]);
+  const dateParam = typeof sp.date === "string" && isRealDate(sp.date) && sp.date.startsWith(month) ? sp.date : null;
+  const selected = dateParam ?? (today.startsWith(month) ? (min.startsWith(month) ? min : today) : `${month}-01`);
+  const day = days.find((d) => d.date === selected)!;
+
+  const monthLabel = new Date(`${month}-01T00:00:00Z`).toLocaleDateString("en-GB", { timeZone: "UTC", month: "long", year: "numeric" });
+  const hrefFor = ({ month: m, date }: { month: string; date?: string }) =>
+    `/dashboard/availability?month=${m}${date ? `&date=${date}` : ""}`;
+  const prev = addMonths(month, -1);
+  const next = addMonths(month, 1);
+  const canPrev = prev >= addMonths(thisMonth, -1);
+  const canNext = next <= max.slice(0, 7);
+  const activeDurations = packages.filter((p) => p.isActive).map((p) => p.durationMinutes);
+
   return (
     <>
-      <PageHeader title="Availability" description="Set the days and time slots families can book." />
-      <Card>
-        <p className="text-sm text-neutral-600">
-          Availability and booking management arrive with the booking system. Your studio profile,
-          portfolio and packages are what families will see first — complete those now.
-        </p>
-      </Card>
+      <PageHeader
+        title="Availability"
+        description="Choose which days and times families can book. Existing bookings always keep their time."
+      />
+      <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_380px]">
+        <Card>
+          <div className="mb-4 flex items-center justify-between gap-2">
+            <Link
+              href={hrefFor({ month: prev })}
+              scroll={false}
+              aria-disabled={!canPrev}
+              tabIndex={canPrev ? undefined : -1}
+              className={buttonClass("secondary", "sm", canPrev ? "" : "pointer-events-none opacity-40")}
+            >
+              <span aria-hidden>←</span>
+              <span className="sr-only sm:not-sr-only">Previous</span>
+            </Link>
+            <div className="text-center">
+              <p className="font-semibold text-neutral-900" aria-live="polite">{monthLabel}</p>
+              {month !== thisMonth && (
+                <Link href={hrefFor({ month: thisMonth })} scroll={false} className="text-xs text-brand-700 hover:underline">
+                  Back to this month
+                </Link>
+              )}
+            </div>
+            <Link
+              href={hrefFor({ month: next })}
+              scroll={false}
+              aria-disabled={!canNext}
+              tabIndex={canNext ? undefined : -1}
+              className={buttonClass("secondary", "sm", canNext ? "" : "pointer-events-none opacity-40")}
+            >
+              <span className="sr-only sm:not-sr-only">Next</span>
+              <span aria-hidden>→</span>
+            </Link>
+          </div>
+          <AvailabilityCalendar month={month} monthLabel={monthLabel} days={days} selected={selected} today={today} hrefFor={hrefFor} />
+          <ul className="mt-4 flex flex-wrap gap-x-4 gap-y-2 text-xs text-neutral-600" aria-label="Legend">
+            {LEGEND.map((l) => (
+              <li key={l.label} className="flex items-center gap-1.5">
+                <span className={`size-2.5 rounded-full ${l.swatch}`} aria-hidden />
+                {l.label}
+              </li>
+            ))}
+          </ul>
+          <p className="mt-3 text-xs text-neutral-500">
+            Days without changes use standard hours. Customers only ever see times that are still free — pending,
+            confirmed and completed bookings are never offered again.
+          </p>
+        </Card>
+        <Card className="xl:self-start">
+          <DayEditor key={day.date} studioId={studio.id} day={day} packageDurations={activeDurations} />
+        </Card>
+      </div>
     </>
   );
 }

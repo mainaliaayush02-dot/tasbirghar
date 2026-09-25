@@ -1,5 +1,7 @@
 import { PHOTOGRAPHY_CATEGORIES, type CategorySlug } from "@/config/categories";
 import { LOCATIONS, type LocationSlug } from "@/config/locations";
+import { MAX_SLOTS_PER_DAY } from "@/lib/booking/rules";
+import { BOOKING_ACTIONS, type BookingAction } from "@/lib/booking/transitions";
 import type { GalleryImageKind } from "@/types/models";
 
 import {
@@ -309,8 +311,7 @@ export const bookingCreateSchema: Schema<BookingCreateInput> = {
   customerNote: optionalText({ max: 500, multiline: true }),
 };
 
-export const BOOKING_ACTIONS = ["cancel", "confirm", "decline", "complete"] as const;
-export type BookingAction = (typeof BOOKING_ACTIONS)[number];
+export { BOOKING_ACTIONS, type BookingAction };
 
 export interface BookingActionInput {
   action: BookingAction;
@@ -318,4 +319,46 @@ export interface BookingActionInput {
 
 export const bookingActionSchema: Schema<BookingActionInput> = {
   action: oneOf(BOOKING_ACTIONS, "Unknown action."),
+};
+
+/* ---------------------------------------------------------- availability */
+
+export interface AvailabilitySlotInput {
+  start: string;
+  end: string;
+}
+
+export interface AvailabilityDayInput {
+  /** true = the studio takes no bookings that day (slots must be empty). */
+  isClosed: boolean;
+  /** Custom windows for the day; sessions must fit inside one of them. */
+  slots: AvailabilitySlotInput[];
+}
+
+const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+/** A list of { start, end } objects with no other keys. Semantic checks
+ * (steps, order, overlaps) happen in `slotsError` on the server. */
+function slotList(max: number): (value: unknown) => { ok: true; value: AvailabilitySlotInput[] } | { ok: false; error: string } {
+  return (value) => {
+    if (!Array.isArray(value)) return { ok: false, error: "Required." };
+    if (value.length > max) return { ok: false, error: `Up to ${max} time slots per day.` };
+    const out: AvailabilitySlotInput[] = [];
+    for (const item of value) {
+      if (typeof item !== "object" || item === null || Array.isArray(item)) return { ok: false, error: "Invalid time slot." };
+      const keys = Object.keys(item);
+      if (keys.length !== 2 || !keys.includes("start") || !keys.includes("end")) return { ok: false, error: "Invalid time slot." };
+      const { start, end } = item as Record<string, unknown>;
+      if (typeof start !== "string" || typeof end !== "string" || !HHMM.test(start) || !HHMM.test(end)) {
+        return { ok: false, error: "Times must be HH:mm." };
+      }
+      out.push({ start, end });
+    }
+    return { ok: true, value: out };
+  };
+}
+
+export const availabilityDaySchema: Schema<AvailabilityDayInput> = {
+  isClosed: bool(),
+  slots: slotList(MAX_SLOTS_PER_DAY),
 };

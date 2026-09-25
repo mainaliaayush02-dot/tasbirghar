@@ -2,11 +2,13 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 
 import { BookingActions } from "@/components/bookings/booking-ui";
-import { BookingStatusPill } from "@/components/bookings/booking-status";
+import { BookingStatusPill, CUSTOMER_STATUS_COPY } from "@/components/bookings/booking-status";
 import { Alert, Card, PageHeader } from "@/components/ui/feedback";
 import { requireUser } from "@/lib/auth/current-user";
+import { nepalToday } from "@/lib/booking/rules";
+import { availableActions } from "@/lib/booking/transitions";
 import { getCustomerBooking } from "@/lib/data/bookings";
-import { formatDate } from "@/lib/format";
+import { formatDate, formatDay, formatTimeRange } from "@/lib/format";
 import { formatMoney } from "@/lib/money";
 
 export const metadata = { title: "Booking" };
@@ -16,7 +18,10 @@ export default async function BookingDetailPage({ params, searchParams }: PagePr
   const user = await requireUser("account", `/account/bookings/${bookingId}`);
   const booking = await getCustomerBooking(user.uid, bookingId);
   if (!booking) notFound();
-  const created = (await searchParams).created === "1";
+  // The "request sent" banner only while the request is still pending.
+  const created = (await searchParams).created === "1" && booking.bookingStatus === "pending";
+  const status = CUSTOMER_STATUS_COPY[booking.bookingStatus];
+  const actions = availableActions(booking.bookingStatus, "customer", { shootDate: booking.shootDate, today: nepalToday() });
 
   return (
     <main className="space-y-6">
@@ -25,9 +30,13 @@ export default async function BookingDetailPage({ params, searchParams }: PagePr
       </Link>
       <PageHeader title={booking.studio.businessName} description={booking.packageName} actions={<BookingStatusPill status={booking.bookingStatus} />} />
 
-      {created && (
+      {created ? (
         <Alert tone="success" title="Booking request sent">
           {booking.studio.businessName} has received your request and will confirm it. You&apos;ll see the status change here.
+        </Alert>
+      ) : (
+        <Alert tone={status.tone} title={status.title}>
+          {status.body}
         </Alert>
       )}
 
@@ -35,12 +44,12 @@ export default async function BookingDetailPage({ params, searchParams }: PagePr
         <dl className="grid gap-4 text-sm sm:grid-cols-2">
           <div>
             <dt className="text-neutral-500">Date</dt>
-            <dd className="mt-0.5 font-medium text-neutral-900">{formatDate(booking.shootDate)}</dd>
+            <dd className="mt-0.5 font-medium text-neutral-900">{formatDay(booking.shootDate, "long")}</dd>
           </div>
           <div>
             <dt className="text-neutral-500">Time</dt>
             <dd className="mt-0.5 font-medium text-neutral-900">
-              {booking.startTime}–{booking.endTime} (Nepal time)
+              {formatTimeRange(booking.startTime, booking.endTime)} (Nepal time)
             </dd>
           </div>
           <div>
@@ -61,6 +70,10 @@ export default async function BookingDetailPage({ params, searchParams }: PagePr
             <dt className="text-neutral-500">Requested</dt>
             <dd className="mt-0.5 text-neutral-900">{formatDate(booking.createdAt, true)}</dd>
           </div>
+          <div>
+            <dt className="text-neutral-500">Booking ID</dt>
+            <dd className="mt-0.5 font-mono text-xs break-all text-neutral-900">{booking.id}</dd>
+          </div>
           {booking.customerNote && (
             <div className="sm:col-span-2">
               <dt className="text-neutral-500">Your note</dt>
@@ -72,7 +85,13 @@ export default async function BookingDetailPage({ params, searchParams }: PagePr
           <Link href={`/photographers/${booking.studio.slug}`} className="text-sm font-medium text-brand-700 hover:underline">
             View studio
           </Link>
-          {booking.bookingStatus === "pending" && <BookingActions bookingId={booking.id} actions={["cancel"]} />}
+          {actions.length > 0 && <BookingActions bookingId={booking.id} actions={actions} />}
+          {booking.bookingStatus === "confirmed" && (
+            <p className="text-sm text-neutral-500">
+              Need to change or cancel a confirmed booking?{" "}
+              <Link href="/contact" className="font-medium text-brand-700 hover:underline">Contact TasbirGhar</Link>
+            </p>
+          )}
         </div>
       </Card>
     </main>

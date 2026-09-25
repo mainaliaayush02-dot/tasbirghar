@@ -180,7 +180,7 @@ Design notes:
 
 - **Search and filtering.** `StudioDoc` stores `categories[]`, `location.city` and `startingPrice` (the lowest active package price, maintained server-side). Listing pages can filter by category, location and budget with a single query on `studios`.
 - **Package-level search.** `PackageDoc` repeats `studioId` and `category`, so a collection-group query on `packages` can answer "newborn packages under Rs. 20,000" across all studios. Composite indexes go in `firestore.indexes.json` as queries are added.
-- **Availability.** One document per studio per day, with the date as the document ID. A day check is a single `get`, and a month view is a range query on the document ID.
+- **Availability.** One document per studio per day, with the date as the document ID. A day check is a single `get`, and a month view is one batched `getAll` of that month's day documents (see section 6a).
 - **Bookings snapshot** the package and studio details at booking time, so editing a package later never changes past bookings.
 - **Timestamps** use Firestore `Timestamp`. Shoot dates and times are stored as `"YYYY-MM-DD"` and `"HH:mm"` strings in `Asia/Kathmandu`, which avoids timezone drift for calendar dates.
 
@@ -270,6 +270,9 @@ To remove admin, run `npm run admin:grant -- --email you@example.com --revoke --
 | `POST /api/media/sign` / `POST /api/media/confirm` | owner | signed direct upload; confirm writes the media record (portfolio, gallery, profile, cover) |
 | `PATCH/DELETE /api/studios/{id}/{portfolio\|gallery}/{itemId}` | owner | caption, category, order, featured, or delete (deletes the asset too) |
 | `POST /api/studios/{id}/packages`, `PUT/DELETE …/packages/{packageId}` | owner | packages (rupees in, integer paisa stored); keeps `startingPrice` in sync |
+| `PUT/DELETE /api/studios/{id}/availability/{date}` | owner | set a day's custom slots or mark it unavailable / reset it to standard hours (Phase 4A) |
+| `GET /api/studios/{id}/availability?month=&packageId=` / `?date=` | anyone (published studios) | bookable dates and free start times / one day's published open hours (never booking-derived) |
+| `POST /api/bookings`, `POST /api/bookings/{id}` | customer / customer or owner | request a booking; status transitions |
 
 Ownership is checked with `assertStudioOwner(studioId, sessionUid)`. Admins are **not** owners, so moderation will get its own routes.
 
@@ -303,7 +306,7 @@ The owner is an ordinary Firebase Auth account that has been given the `admin` c
 | `(public)` | `/` (later `/photographers`, `/categories/[category]`, `/locations/[location]`, `/search`) |
 | `(auth)` | `/login`, `/signup` (noindex) |
 | `(customer)` | `/account`, `/become-a-photographer` |
-| `(studio)` | `/dashboard`, `/dashboard/studio`, `/portfolio`, `/gallery`, `/packages`, `/availability` (placeholder), `/verification` |
+| `(studio)` | `/dashboard`, `/dashboard/studio`, `/portfolio`, `/gallery`, `/packages`, `/bookings`, `/availability`, `/verification` |
 | `(admin)` | `/admin`, `/admin/applications[/uid]`, `/admin/studios[/id]`, `/admin/photographers`, `/admin/customers`, `/admin/bookings`, `/admin/reviews`, `/admin/commission`, `/admin/settings` |
 
 ---
@@ -352,17 +355,13 @@ The public header is **cookie-free**. The account area loads client-side from `G
 - **Rules** (`src/lib/booking/rules.ts`, shared by server and form): dates run from tomorrow to 180 days ahead in Asia/Kathmandu; start times fall on 30-minute steps; active (window-holding) statuses are `pending` and `confirmed`; a customer may hold at most 5 pending requests.
 - **The transaction** (`src/lib/booking/service.ts`):
   1. Read `bookingLocks/{studioId}_{date}`, the day's availability doc, all bookings for that studio-day, and the studio again.
-  2. Reject if the studio is no longer published, the day is closed, the window is outside the open hours (published slots, or the default 07:00–20:00), or it overlaps an active booking.
+  2. Reject if the studio is no longer published, the day is closed, the window is outside the open hours (published slots, or the default 07:00–20:00), or it overlaps a blocking booking (`pending`, `confirmed` or `completed`).
   3. Create the booking with `calculateCommission(packagePrice, internal.commissionRateBps ?? 800)` (read from `private/internal`, alongside the owner uid copied to `studioOwnerId`), then write the lock back.
   Because every booking write for a studio-day reads and writes the same lock document, Firestore serializes those transactions, so two concurrent requests can't both pass the overlap check. An API test fires 5 simultaneous requests for one slot and exactly one succeeds.
-- **Availability is advisory.** Photographer-controlled `availability` docs can close a day or restrict hours, but existing bookings are the final authority. `GET /api/studios/{id}/availability?date=` (public, published studios only, `no-store`) shows open and busy windows to the form; the POST re-checks everything.
-- **Status changes, `POST /api/bookings/{id}`:**
-  - `cancel`: the customer, while the booking is pending.
-  - `confirm` and `decline`: the owner, while pending; confirm re-checks overlaps under the lock.
-  - `complete`: the owner, from the shoot date onward; this sets `payoutStatus: pending` and increments `stats.completedBookings`.
-  Owners are verified against both `studioOwnerId` and the current `private/internal.ownerId`. Admins have no booking write path.
-- **Pages:** `/account/bookings` and `/account/bookings/[id]` for customers (ownership-checked; no commission shown), `/dashboard/bookings` for studios (with their payout and TasbirGhar's commission), `/admin/bookings` for the owner.
-- **Not built yet:** online payment (eSewa or Khalti), payout processing, reviews submission and a studio availability editor. Bookings are requests confirmed by the studio, and customers are told that no payment is taken online.
+- **Availability narrows, bookings decide.** A studio's availability can close a day or restrict it to custom slots, but existing bookings are always the final authority for conflicts (section 6a).
+- **Status changes, `POST /api/bookings/{id}`:** validated against the explicit transition table in `src/lib/booking/transitions.ts` (section 6a). Owners are verified against both `studioOwnerId` and the current `private/internal.ownerId`. Admins have no booking write path.
+- **Pages:** `/account/bookings` and `/account/bookings/[id]` for customers (ownership-checked; no commission shown), `/dashboard/bookings` and `/dashboard/availability` for studios (with their payout and TasbirGhar's commission), `/admin/bookings` for the owner (read-only).
+- **Not built yet:** online payment (eSewa or Khalti), payout processing, reviews submission and notifications. Bookings are requests confirmed by the studio. **No payment is taken online yet**, and customers are told so.
 
 ### SEO
 
@@ -373,6 +372,86 @@ The public header is **cookie-free**. The account area loads client-side from `G
   - `BreadcrumbList` (studio, category and location pages)
   - `FAQPage` (How it works)
 - **Sitemap:** static pages, categories, locations and **published** studios only, with `lastModified`. `robots.txt` disallows the private areas, booking forms and auth pages, and blocks everything on preview deployments.
+
+---
+
+## 6a. Availability and the booking lifecycle (Phase 4A)
+
+The core loop: the studio sets availability → the customer sees only free dates and times → requests a booking → the studio confirms or declines → the customer tracks the status → the studio marks the session completed.
+
+### Availability model
+
+`studios/{studioId}/availability/{YYYY-MM-DD}` (`AvailabilityDayDoc`), one per day, **written only by the server**:
+
+| Day state | Stored as | Customers can book |
+| --- | --- | --- |
+| Standard hours | no document | 7:00 AM – 8:00 PM (`DEFAULT_OPEN`–`DEFAULT_CLOSE`) |
+| Custom time slots | `isClosed: false`, `slots: [{ start, end, status: "open", bookingId: null }]` | only inside one of the slots |
+| Unavailable | `isClosed: true`, `slots: []` | nothing |
+
+- A session must fit **inside one slot** (a 2-hour package cannot span two adjacent 1-hour slots). Candidate start times are every 30 minutes from the slot start.
+- Slots are validated server-side by `slotsError` (`src/lib/booking/rules.ts`, also used by the editor for instant feedback): `HH:mm` on 30-minute steps, end after start (no zero-length), no overlaps or duplicates (adjacent is fine), at most 12 per day. The request schema rejects unknown keys, so a client can't write `status` or `bookingId` into a slot.
+- Only dates from tomorrow to 180 days ahead (Nepal time) can be changed, the same window customers can book. Past dates are read-only.
+- Slots never store booking information; bookings are read from `bookings` at request time.
+
+### Owner editor (`/dashboard/availability`)
+
+A month calendar (previous / current / next, up to the last bookable month) showing each day's state and colored dots for pending, confirmed and completed bookings, plus a day panel: standard hours / custom time slots (add, edit, delete) / unavailable, and the day's bookings. Selecting a day is a link (`?month=&date=`), so it works without JavaScript and is shareable.
+
+Writes go to `PUT /api/studios/{id}/availability/{date}` `{ isClosed, slots }` or `DELETE` (back to standard hours), after `requireApiUser("photographer")` and `assertStudioOwner`. `setDayAvailability` (`service.ts`) runs **in a transaction on the same `bookingLocks/{studioId}_{date}` document as bookings** and refuses (409 `BOOKED_TIME`) any change that would leave a `pending` or `confirmed` booking outside the new open hours, including closing the day. The photographer must decline or cancel the booking first. So availability can never be used to strand a booking, and a booking can never slip in against a stale schedule.
+
+### Customer booking flow
+
+Studio → package → date → time → details → summary → submit (`/photographers/{slug}/book`, sign-in required, `noindex`, disallowed in robots).
+
+- The calendar and times come from `GET /api/studios/{id}/availability?month=YYYY-MM&packageId=…`: it returns **only** bookable dates and the start times still free for that package's duration (`freeStartTimes`, which is the same test the booking transaction applies). It returns no booking IDs, names, statuses or busy windows. The first month is rendered server-side. The `?date=YYYY-MM-DD` mode returns only that day's published open hours (`isClosed`, `open`, `source`); it isn't derived from bookings at all.
+- Dates with no free time are disabled; a date with none shows "No availability on this date".
+- If someone else takes the time first, the POST returns 409 and the form shows "This time is no longer available. Please choose another time." and reloads the month.
+- The request body is `studioId, packageId, shootDate, startTime, customerName, customerPhone, customerNote`. Price, commission, photographer net, owner, end time and status are derived server-side; any other field is rejected (422).
+
+### Conflict rules and concurrency
+
+- **Blocking statuses** (`BLOCKING_BOOKING_STATUSES`): `pending`, `confirmed`, `completed`. No new request may overlap them. `declined`, `cancelled_by_customer` and `cancelled_by_studio` free the window immediately.
+- Every booking create, confirm, cancel, decline and availability edit for a studio-day reads and writes `bookingLocks/{studioId}_{date}` inside its transaction, so Firestore serializes them. Covered by API tests: two customers racing for one slot (exactly one wins), five racers (exactly one wins), and closing a day while a booking is being requested (exactly one of the two succeeds, never both).
+- Confirming re-checks overlaps under the lock.
+
+### Status transitions (`src/lib/booking/transitions.ts`)
+
+| From | Action | Who | To |
+| --- | --- | --- | --- |
+| `pending` | `confirm` | studio | `confirmed` |
+| `pending` | `decline` | studio | `declined` |
+| `pending` | `cancel` | customer | `cancelled_by_customer` |
+| `confirmed` | `complete` (on or after the shoot date) | studio | `completed` |
+| `confirmed` | `studio_cancel` | studio | `cancelled_by_studio` |
+
+Everything else is refused: 409 for an invalid transition, 403 for the wrong actor, 404 for users unrelated to the booking. `completed`, `declined`, `cancelled_*` and `no_show` are final. The same table drives the buttons shown in the dashboards, and a unit test (`npm run test:unit`) checks every status × action × actor combination.
+
+**Cancellation policy:** customers can cancel online **only while the request is pending**. Cancelling a *confirmed* booking needs a business policy (notice period, deposits or refunds once payments exist) that hasn't been decided, so for now the customer is pointed to TasbirGhar support and the studio can cancel a confirmed booking itself (`studio_cancel`). The studio has no reason field yet.
+
+### Dashboards
+
+- `/dashboard/bookings`: tabs All / Pending / Confirmed / Completed / Cancelled / Declined, with cards showing booking ID, customer, package, date, time, amount, status, requested date, and the studio's own payout and commission (existing Phase 3 behavior). Actions: Confirm/Decline (pending), Mark completed (confirmed, from the shoot date) and Cancel booking (confirmed).
+- `/account/bookings`: Upcoming and History, each card with a plain-language status ("Booking confirmed", "Waiting for the studio"…), studio, package, date, time, price, booking ID and requested date. The detail page offers Cancel only while pending.
+- `/admin/bookings`: unchanged and read-only; adds filter tabs for "Cancelled by studio" and "Declined".
+
+### Permissions summary
+
+| Actor | Availability | Bookings |
+| --- | --- | --- |
+| Customer | read (published studios) via API | create (API); read own; cancel own pending (API) |
+| Studio owner | read own (rules + dashboard); write only via the owner API | read own studio's; confirm / decline / complete / cancel via API |
+| Other photographer | no access to a draft studio's data; no writes | none |
+| Admin | read; **no client writes** | read-only; no booking write path |
+| Client SDK (anyone) | **no writes** (rules) | **no writes** (rules) |
+
+### Known limitations (4A)
+
+- Standard hours are a fixed 7:00 AM – 8:00 PM for days without a custom schedule; there are no weekly templates or bulk edits yet (each date is set individually).
+- No notifications (email or SMS): customers and studios see changes when they open their pages.
+- There's no customer cancellation of confirmed bookings (see the policy note above) and no reason text on declines or studio cancellations.
+- `no_show` exists in the model but has no action yet.
+- `/dashboard/bookings` loads up to 300 bookings per studio in memory (fine at launch scale; paginate later).
 
 ---
 
@@ -441,20 +520,20 @@ Local values go in `.env.local`, which is gitignored. Production and preview val
 
 ### Firestore rules: what clients may do
 
-`firestore.rules` is deny-by-default and is covered by `tests/firestore-rules.test.mjs` (115 emulator tests). Client updates use **field allowlists**, so any field not listed is immutable from the client SDK.
+`firestore.rules` is deny-by-default and is covered by `tests/firestore-rules.test.mjs` (124 emulator tests). Client updates use **field allowlists**, so any field not listed is immutable from the client SDK.
 
 | Actor | Allowed | Everything else |
 | --- | --- | --- |
 | Anyone (signed out) | Read published studios and their portfolio, gallery, packages and availability. `get` a single `studioSlugs/{slug}`. Read published reviews. | Denied, including draft studios, listing slugs and every `studios/{id}/private/*` doc |
 | Signed-in user (customer) | Create own `users/{uid}` with `role: "customer"`, `studioId: null`, `photo: null`. Read own user doc. Update own `displayName`, `phone`, `updatedAt`. Read own bookings and own reviews. | Denied |
-| Photographer (owner: `users/{uid}.studioId` equals the studio id) | `get` own `private/contact` (not `private/internal`). Update own studio: `businessName`, `description`, `location` (keys `city`, `area`, `geo` only), `categories`, `facilities`, `props`, `updatedAt`. Portfolio: update `caption`, `category`, `sortOrder`, `isFeatured`, or delete. Gallery: update `caption`, `sortOrder`, or delete. Packages: create with `images: []`, NPR and an integer price; update details and price; delete. Availability: create, update `isClosed`/`slots`, delete. Read bookings where `studioOwnerId` is the photographer's uid. | Denied, including every other studio |
+| Photographer (owner: `users/{uid}.studioId` equals the studio id) | `get` own `private/contact` (not `private/internal`). Update own studio: `businessName`, `description`, `location` (keys `city`, `area`, `geo` only), `categories`, `facilities`, `props`, `updatedAt`. Portfolio: update `caption`, `category`, `sortOrder`, `isFeatured`, or delete. Gallery: update `caption`, `sortOrder`, or delete. Packages: create with `images: []`, NPR and an integer price; update details and price; delete. Read own availability (writes go through the owner API since Phase 4A). Read bookings where `studioOwnerId` is the photographer's uid. | Denied, including every other studio |
 | Admin (claim) | **Read** users, studios (including drafts) and their subcollections, `private/contact` and `private/internal` (single `get`), bookings and reviews. | **All client writes denied.** Admin mutations (moderation, commission, role grants) go through server routes using the Admin SDK. |
-| Server (Admin SDK) | Everything, since it bypasses rules: studio creation and slug reservation, `private/contact` and `private/internal`, statuses, commission, stats, `startingPrice`, all `MediaAsset` fields, portfolio and gallery creation, package images, role claims and mirror, bookings, reviews. | n/a |
+| Server (Admin SDK) | Everything, since it bypasses rules: studio creation and slug reservation, `private/contact` and `private/internal`, availability, statuses, commission, stats, `startingPrice`, all `MediaAsset` fields, portfolio and gallery creation, package images, role claims and mirror, bookings, reviews. | n/a |
 
 Run the tests with a Firestore emulator running (`npx firebase-tools emulators:start --only firestore --project tasbirghar-f285b`), then `npm run test:rules`. Deploy with `npx firebase-tools deploy --only firestore:rules --project tasbirghar-f285b`, and only after the tests pass.
 
 Notes for later phases:
-- Owners control availability `slots`. Booking code must re-check slot conflicts against `bookings` server-side and never trust a slot's `status`.
+- Availability is server-written since Phase 4A. Booking code still re-checks every conflict against `bookings` and never trusts a slot's `status`.
 - `bookings.studioOwnerId` is denormalized for rules. Any future studio ownership transfer must update it, together with `private/internal.ownerId` and both users' `studioId`.
 - Rules derive studio ownership from `users/{uid}.studioId` (one extra `get` per owner request). It is written only by the studio-creation transaction; clients must create it as `null` and cannot update it.
 - The `users/{uid}.email` mirror is client-set at sign-up. Server code must use the email from the verified ID token.

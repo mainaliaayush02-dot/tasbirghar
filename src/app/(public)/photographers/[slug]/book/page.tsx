@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 
 import { requireUser } from "@/lib/auth/current-user";
 import { bookableRange } from "@/lib/booking/rules";
+import { getMonthAvailability } from "@/lib/booking/service";
 import { getPublishedStudioBySlug } from "@/lib/data/public";
 import { getAccount } from "@/lib/data/users";
 
@@ -37,8 +38,12 @@ export default async function BookPage({ params, searchParams }: PageProps<"/pho
     );
   }
 
-  const account = await getAccount(user);
   const { min, max } = bookableRange();
+  const initialPackageId = packageParam && studio.packages.some((p) => p.id === packageParam) ? packageParam : studio.packages[0].id;
+  const [account, initialMonth] = await Promise.all([
+    getAccount(user),
+    getMonthAvailability(studio.id, min.slice(0, 7), initialPackageId),
+  ]);
 
   return (
     <div className="mx-auto w-full max-w-5xl px-4 pt-10 pb-20 sm:px-6 lg:px-8">
@@ -59,9 +64,10 @@ export default async function BookPage({ params, searchParams }: PageProps<"/pho
           editedPhotos: p.editedPhotos,
           category: p.category,
         }))}
-        initialPackageId={packageParam && studio.packages.some((p) => p.id === packageParam) ? packageParam : studio.packages[0].id}
-        minDate={min}
-        maxDate={max}
+        initialPackageId={initialPackageId}
+        initialMonth={initialMonth}
+        minMonth={min.slice(0, 7)}
+        maxMonth={max.slice(0, 7)}
         defaults={{ name: account.displayName, phone: account.phone ?? "" }}
       />
     </div>

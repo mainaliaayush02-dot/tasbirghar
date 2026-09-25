@@ -15,7 +15,9 @@ const TABS: { value: BookingStatus | ""; label: string }[] = [
   { value: "pending", label: "Requested" },
   { value: "confirmed", label: "Confirmed" },
   { value: "completed", label: "Completed" },
-  { value: "cancelled_by_customer", label: "Cancelled" },
+  { value: "cancelled_by_customer", label: "Cancelled by customer" },
+  { value: "cancelled_by_studio", label: "Cancelled by studio" },
+  { value: "declined", label: "Declined" },
 ];
 
 export default async function BookingsPage({ searchParams }: PageProps<"/admin/bookings">) {
@@ -41,7 +43,7 @@ export default async function BookingsPage({ searchParams }: PageProps<"/admin/b
           <EmptyState title="No bookings yet" icon="bookings">
             {status || q
               ? "No bookings match these filters."
-              : "Booking management is ready for the next marketplace phase. Bookings will appear here once customers can book studios."}
+              : "Bookings appear here as soon as customers request a session with a published studio."}
           </EmptyState>
         ) : (
           <>

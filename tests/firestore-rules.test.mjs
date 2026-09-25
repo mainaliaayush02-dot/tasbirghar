@@ -570,13 +570,20 @@ describe("photographer (owner of studioA)", () => {
     );
     await assertSucceeds(deleteDoc(ref(photographer(), "studios/studioA/packages/new")));
   });
-  test("CAN manage own availability", async () => {
-    await assertSucceeds(
-      setDoc(ref(photographer(), "studios/studioA/availability/2026-10-02"), availabilityDoc("studioA", "2026-10-02")),
-    );
-    await assertSucceeds(
-      updateDoc(ref(photographer(), "studios/studioA/availability/2026-10-01"), { isClosed: true }),
-    );
+  test("CAN read own availability (even while the studio is a draft)", async () => {
+    await assertSucceeds(getDoc(ref(photographer(), "studios/studioA/availability/2026-10-01")));
+    await assertSucceeds(getDoc(ref(photographer("pb"), "studios/studioB/availability/2026-10-01")));
+  });
+  test("availability is server-written only: the owner cannot create, edit or delete it directly (Phase 4A)", async () => {
+    // Owners manage availability through PUT/DELETE /api/studios/{id}/availability/{date},
+    // which validates slots and serializes with bookings under the studio-day lock.
+    const db = photographer();
+    await assertFails(setDoc(ref(db, "studios/studioA/availability/2026-10-02"), availabilityDoc("studioA", "2026-10-02")));
+    await assertFails(updateDoc(ref(db, "studios/studioA/availability/2026-10-01"), { isClosed: true }));
+    await assertFails(updateDoc(ref(db, "studios/studioA/availability/2026-10-01"), {
+      slots: [{ start: "10:00", end: "12:00", status: "open", bookingId: null }, { start: "11:00", end: "13:00", status: "open", bookingId: null }],
+    }));
+    await assertFails(deleteDoc(ref(db, "studios/studioA/availability/2026-10-01")));
   });
   test("cannot create availability with mismatched date or studioId", async () => {
     await assertFails(
@@ -889,5 +896,74 @@ describe("booking writes stay server-only (Phase 3)", () => {
     await assertFails(updateDoc(ref(customer(), "bookings/b1"), { bookingStatus: "confirmed" }));
     await assertFails(updateDoc(ref(customer(), "bookings/b1"), { bookingStatus: "cancelled_by_customer" }));
     await assertFails(updateDoc(ref(photographer(), "bookings/b1"), { bookingStatus: "confirmed" }));
+  });
+});
+
+
+/* ---------------------------------------------- availability + bookings (4A) */
+
+describe("availability and booking integrity (Phase 4A)", () => {
+  const AV_A = "studios/studioA/availability/2026-10-01";
+  const AV_B = "studios/studioB/availability/2026-10-01";
+
+  test("nobody can write availability from the client (owner, other photographer, customer, admin, anon)", async () => {
+    for (const db of [photographer("pa"), photographer("pb"), customer(), customerWithClaim(), admin(), anon()]) {
+      await assertFails(updateDoc(ref(db, AV_A), { isClosed: true }));
+      await assertFails(setDoc(ref(db, "studios/studioA/availability/2026-11-01"), availabilityDoc("studioA", "2026-11-01")));
+      await assertFails(deleteDoc(ref(db, AV_A)));
+    }
+  });
+  test("another photographer cannot read or manage a draft studio's availability", async () => {
+    await assertFails(getDoc(ref(photographer("pa"), AV_B)));
+    await assertFails(updateDoc(ref(photographer("pa"), AV_B), { isClosed: false }));
+  });
+  test("no availability for a nonexistent studio", async () => {
+    await assertFails(setDoc(ref(photographer(), "studios/ghost/availability/2026-10-01"), availabilityDoc("ghost", "2026-10-01")));
+    await assertFails(getDoc(ref(photographer(), "studios/ghost/availability/2026-10-01")));
+  });
+
+  const TAMPER = [
+    ["bookingStatus", "confirmed"],
+    ["bookingStatus", "completed"],
+    ["bookingStatus", "cancelled_by_studio"],
+    ["grossAmount", 1],
+    ["commissionRateBps", 0],
+    ["commissionAmount", 0],
+    ["photographerNetAmount", 1500000],
+    ["studioOwnerId", "pb"],
+    ["customerId", "bob"],
+    ["studioId", "studioB"],
+    ["packageId", "cheap"],
+    ["shootDate", "2026-12-25"],
+    ["startTime", "06:00"],
+    ["paymentStatus", "paid"],
+  ];
+
+  test("the studio owner cannot alter any booking field directly", async () => {
+    for (const [field, value] of TAMPER) {
+      await assertFails(updateDoc(ref(photographer("pa"), "bookings/b1"), { [field]: value }));
+    }
+    await assertFails(deleteDoc(ref(photographer("pa"), "bookings/b1")));
+  });
+  test("a photographer cannot read or modify another studio's booking", async () => {
+    await assertFails(getDoc(ref(photographer("pa"), "bookings/b2")));
+    await assertFails(updateDoc(ref(photographer("pa"), "bookings/b2"), { bookingStatus: "confirmed" }));
+  });
+  test("the customer can read their booking but cannot change status, price, studio or photographer", async () => {
+    await assertSucceeds(getDoc(ref(customer("alice"), "bookings/b1")));
+    for (const [field, value] of TAMPER) {
+      await assertFails(updateDoc(ref(customer("alice"), "bookings/b1"), { [field]: value }));
+    }
+  });
+  test("no one can create a booking document directly (even a well-formed one)", async () => {
+    for (const db of [customer("alice"), photographer("pa"), admin()]) {
+      await assertFails(setDoc(ref(db, "bookings/direct"), bookingDoc("alice", "studioA", "pa")));
+    }
+  });
+  test("admin client writes to bookings stay denied", async () => {
+    for (const [field, value] of TAMPER) {
+      await assertFails(updateDoc(ref(admin(), "bookings/b1"), { [field]: value }));
+    }
+    await assertFails(deleteDoc(ref(admin(), "bookings/b1")));
   });
 });

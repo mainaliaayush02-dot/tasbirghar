@@ -8,7 +8,7 @@ import { studioInternalRef, studioRef, studioSub } from "@/lib/data/studios";
 import { adminDb } from "@/lib/firebase/admin";
 import { collections } from "@/lib/firestore/paths";
 import { calculateCommission, DEFAULT_COMMISSION_RATE_BPS } from "@/lib/money";
-import type { BookingAction, BookingCreateInput } from "@/lib/validation/schemas";
+import type { AvailabilityDayInput, BookingCreateInput } from "@/lib/validation/schemas";
 import type {
   AvailabilityDayDoc,
   BookingDoc,
@@ -20,18 +20,23 @@ import type {
 
 import {
   ACTIVE_BOOKING_STATUSES,
+  BLOCKING_BOOKING_STATUSES,
   bookableRange,
   DEFAULT_CLOSE,
   DEFAULT_OPEN,
+  freeStartTimes,
   fromMinutes,
   isRealDate,
   MAX_PENDING_PER_CUSTOMER,
   nepalToday,
   overlaps,
+  monthDates,
   SLOT_STEP_MINUTES,
+  slotsError,
   toMinutes,
   type Window,
 } from "./rules";
+import { checkTransition, type BookingAction } from "./transitions";
 
 /**
  * Server-authoritative booking logic.
@@ -41,8 +46,11 @@ import {
  *   contact). Price, commission, payout, owner, end time and status are
  *   derived here from Firestore — never from the request.
  * - Photographer availability docs may CLOSE a day or RESTRICT times, but the
- *   final authority is the set of existing active bookings, checked inside a
- *   transaction.
+ *   final authority is the set of existing blocking bookings (pending,
+ *   confirmed, completed), checked inside a transaction.
+ * - Availability docs are written only here (setDayAvailability), under the
+ *   same studio-day lock, and an edit that would leave a pending/confirmed
+ *   booking outside the open hours is refused.
  * - Every write for a studio-day first reads `bookingLocks/{studioId}_{date}`
  *   and writes it back. Firestore serializes transactions that touch the same
  *   document, so two concurrent requests can never both pass the overlap
@@ -55,18 +63,21 @@ const lockRef = (studioId: string, date: string) =>
 const bookingsFor = (studioId: string, date: string) =>
   db().collection(collections.bookings).where("studioId", "==", studioId).where("shootDate", "==", date);
 
+/**
+ * Public day view: the studio's published hours ONLY. It is never derived
+ * from bookings, so it reveals no booking IDs, customers, statuses or busy
+ * intervals. Free start times come from getMonthAvailability.
+ */
 export interface DayAvailability {
   date: string;
   isClosed: boolean;
   /** Windows the studio is open for bookings that day. */
   open: Window[];
-  /** Windows already held by active (requested/confirmed) bookings. */
-  busy: Window[];
   /** "studio" when the studio published availability; else default hours. */
   source: "studio" | "default";
 }
 
-function openWindows(day: AvailabilityDayDoc | undefined): { isClosed: boolean; open: Window[]; source: "studio" | "default" } {
+function openWindows(day: Pick<AvailabilityDayDoc, "isClosed" | "slots"> | undefined): { isClosed: boolean; open: Window[]; source: "studio" | "default" } {
   if (!day) return { isClosed: false, open: [{ start: DEFAULT_OPEN, end: DEFAULT_CLOSE }], source: "default" };
   if (day.isClosed) return { isClosed: true, open: [], source: "studio" };
   const slots = (day.slots ?? []).filter((s) => s.status === "open").map((s) => ({ start: s.start, end: s.end }));
@@ -75,22 +86,23 @@ function openWindows(day: AvailabilityDayDoc | undefined): { isClosed: boolean; 
   return { isClosed: false, open: slots, source: "studio" };
 }
 
-const activeWindows = (docs: FirebaseFirestore.QueryDocumentSnapshot[], exceptId?: string): Window[] =>
+const windowsWith = (statuses: BookingStatus[]) => (docs: FirebaseFirestore.QueryDocumentSnapshot[], exceptId?: string): Window[] =>
   docs
-    .filter((d) => d.id !== exceptId && ACTIVE_BOOKING_STATUSES.includes(d.get("bookingStatus") as BookingStatus))
+    .filter((d) => d.id !== exceptId && statuses.includes(d.get("bookingStatus") as BookingStatus))
     .map((d) => ({ start: d.get("startTime") as string, end: d.get("endTime") as string }));
+/** Windows no new request may overlap (pending, confirmed, completed). */
+const blockingWindows = windowsWith(BLOCKING_BOOKING_STATUSES);
+/** Windows the studio still owes (pending, confirmed). */
+const activeWindows = windowsWith(ACTIVE_BOOKING_STATUSES);
 
 /** Public day view for the booking form. Studio must be published. */
 export async function getDayAvailability(studioId: string, date: string): Promise<DayAvailability> {
   const studio = await studioRef(studioId).get();
   if (!studio.exists || studio.get("listingStatus") !== "published") throw notFound("Studio");
   assertBookableDate(date);
-  const [day, bookings] = await Promise.all([
-    studioSub(studioId, "availability").doc(date).get(),
-    bookingsFor(studioId, date).get(),
-  ]);
+  const day = await studioSub(studioId, "availability").doc(date).get();
   const { isClosed, open, source } = openWindows(day.data() as AvailabilityDayDoc | undefined);
-  return { date, isClosed, open, busy: activeWindows(bookings.docs), source };
+  return { date, isClosed, open, source };
 }
 
 function assertBookableDate(date: string) {
@@ -161,7 +173,7 @@ export async function createBooking(user: CurrentUser, input: BookingCreateInput
     if (!fits) {
       throw new ApiError(409, "OUTSIDE_HOURS", "That time is outside the studio's available hours for this date.");
     }
-    if (activeWindows(existing.docs).some((b) => overlaps(b, window))) {
+    if (blockingWindows(existing.docs).some((b) => overlaps(b, window))) {
       throw new ApiError(409, "SLOT_TAKEN", "That time has just been requested by someone else. Please choose another time.");
     }
 
@@ -213,20 +225,18 @@ function touchLock(tx: Transaction, studioId: string, date: string) {
 
 /* ============================================================ transitions */
 
-const TRANSITIONS: Record<BookingAction, { actor: "customer" | "owner"; from: BookingStatus[]; to: BookingStatus }> = {
-  cancel: { actor: "customer", from: ["pending"], to: "cancelled_by_customer" },
-  confirm: { actor: "owner", from: ["pending"], to: "confirmed" },
-  decline: { actor: "owner", from: ["pending"], to: "declined" },
-  complete: { actor: "owner", from: ["confirmed"], to: "completed" },
+const TRANSITION_ERRORS = {
+  INVALID_TRANSITION: (status: BookingStatus) => `This booking is ${status.replaceAll("_", " ")} and can't be changed that way.`,
+  NOT_YET: () => "A booking can be completed on or after the shoot date.",
 };
 
 /**
- * Status changes. Customers may cancel their own pending request; the studio
- * owner (photographer claim + current private/internal ownerId) confirms, declines or
- * completes. Admins have no booking write path here.
+ * Status changes, validated against the explicit table in ./transitions.ts.
+ * Customers may cancel their own pending request; the studio owner
+ * (photographer claim + current private/internal ownerId) confirms, declines,
+ * completes or cancels. Admins have no booking write path here.
  */
 export async function transitionBooking(user: CurrentUser, bookingId: string, action: BookingAction): Promise<BookingStatus> {
-  const rule = TRANSITIONS[action];
   const ref = db().collection(collections.bookings).doc(bookingId);
 
   return db().runTransaction(async (tx) => {
@@ -234,31 +244,39 @@ export async function transitionBooking(user: CurrentUser, bookingId: string, ac
     if (!snap.exists) throw notFound("Booking");
     const b = snap.data() as BookingDoc;
 
-    if (rule.actor === "customer") {
-      if (b.customerId !== user.uid) throw notFound("Booking");
-    } else {
-      if (user.role !== "photographer") throw forbidden();
+    // Who is asking? Unrelated users learn nothing about the booking (404).
+    let actor: "customer" | "studio";
+    if (b.customerId === user.uid) {
+      actor = "customer";
+    } else if (user.role === "photographer" && b.studioOwnerId === user.uid) {
       const internal = await tx.get(studioInternalRef(b.studioId));
-      if (b.studioOwnerId !== user.uid || internal.get("ownerId") !== user.uid) throw notFound("Booking");
-    }
-    if (!rule.from.includes(b.bookingStatus)) {
-      throw new ApiError(409, "INVALID_TRANSITION", `This booking is ${b.bookingStatus.replaceAll("_", " ")}.`);
-    }
-    if (action === "complete" && b.shootDate > nepalToday()) {
-      throw new ApiError(409, "NOT_YET", "A booking can be completed on or after the shoot date.");
+      if (internal.get("ownerId") !== user.uid) throw notFound("Booking");
+      actor = "studio";
+    } else if (user.role === "admin") {
+      throw forbidden(); // admins have no booking write path
+    } else {
+      throw notFound("Booking");
     }
 
-    const update: Record<string, unknown> = { bookingStatus: rule.to, updatedAt: FieldValue.serverTimestamp() };
+    const check = checkTransition(b.bookingStatus, action, actor, { shootDate: b.shootDate, today: nepalToday() });
+    if (!check.ok) {
+      if (check.reason === "WRONG_ACTOR") throw forbidden();
+      if (check.reason === "NOT_YET") throw new ApiError(409, "NOT_YET", TRANSITION_ERRORS.NOT_YET());
+      throw new ApiError(409, "INVALID_TRANSITION", TRANSITION_ERRORS.INVALID_TRANSITION(b.bookingStatus));
+    }
+    const to = check.transition.to;
+
+    const update: Record<string, unknown> = { bookingStatus: to, updatedAt: FieldValue.serverTimestamp() };
     if (action === "confirm") {
-      // Re-check against other active bookings under the same studio-day lock.
+      // Re-check against other blocking bookings under the same studio-day lock.
       const [, existing] = await Promise.all([tx.get(lockRef(b.studioId, b.shootDate)), tx.get(bookingsFor(b.studioId, b.shootDate))]);
-      if (activeWindows(existing.docs, bookingId).some((w) => overlaps(w, { start: b.startTime, end: b.endTime }))) {
+      if (blockingWindows(existing.docs, bookingId).some((w) => overlaps(w, { start: b.startTime, end: b.endTime }))) {
         throw new ApiError(409, "SLOT_TAKEN", "Another booking already holds this time.");
       }
       update.confirmedAt = FieldValue.serverTimestamp();
       touchLock(tx, b.studioId, b.shootDate);
     }
-    if (action === "cancel" || action === "decline") {
+    if (action === "cancel" || action === "decline" || action === "studio_cancel") {
       update.cancelledAt = FieldValue.serverTimestamp();
       touchLock(tx, b.studioId, b.shootDate);
     }
@@ -268,6 +286,172 @@ export async function transitionBooking(user: CurrentUser, bookingId: string, ac
       tx.update(studioRef(b.studioId), { "stats.completedBookings": FieldValue.increment(1) });
     }
     tx.update(ref, update);
-    return rule.to;
+    return to;
   });
+}
+
+/* =========================================================== availability */
+
+/** Bookings of a studio on the given dates (index-free: equality + `in`). */
+async function bookingsOnDates(studioId: string, dates: string[]) {
+  const chunks: string[][] = [];
+  for (let i = 0; i < dates.length; i += 30) chunks.push(dates.slice(i, i + 30));
+  const snaps = await Promise.all(
+    chunks.map((chunk) =>
+      db().collection(collections.bookings).where("studioId", "==", studioId).where("shootDate", "in", chunk).get(),
+    ),
+  );
+  return snaps.flatMap((s) => s.docs);
+}
+
+async function availabilityDocs(studioId: string, dates: string[]) {
+  const col = studioSub(studioId, "availability");
+  const snaps = dates.length ? await db().getAll(...dates.map((d) => col.doc(d))) : [];
+  return new Map(snaps.map((s) => [s.id, s.data() as AvailabilityDayDoc | undefined]));
+}
+
+export interface MonthAvailability {
+  month: string;
+  /** Bookable dates in the month → start times still free for the package. */
+  days: Record<string, string[]>;
+}
+
+/**
+ * Public month view for the booking calendar (published studios only).
+ * Returns ONLY dates and start times a customer can request — no booking
+ * details. Informational: the booking POST re-checks everything.
+ */
+export async function getMonthAvailability(studioId: string, month: string, packageId: string): Promise<MonthAvailability> {
+  const [studio, pkgSnap] = await Promise.all([
+    studioRef(studioId).get(),
+    studioSub(studioId, "packages").doc(packageId).get(),
+  ]);
+  if (!studio.exists || studio.get("listingStatus") !== "published") throw notFound("Studio");
+  const pkg = pkgSnap.data() as PackageDoc | undefined;
+  if (!pkg || !pkg.isActive || pkg.studioId !== studioId) throw notFound("Package");
+
+  const { min, max } = bookableRange();
+  const dates = monthDates(month).filter((d) => d >= min && d <= max);
+  const [dayDocs, bookings] = await Promise.all([availabilityDocs(studioId, dates), bookingsOnDates(studioId, dates)]);
+
+  const days: Record<string, string[]> = {};
+  for (const date of dates) {
+    const { isClosed, open } = openWindows(dayDocs.get(date));
+    if (isClosed) continue;
+    const blocking = blockingWindows(bookings.filter((b) => b.get("shootDate") === date));
+    const times = freeStartTimes(open, blocking, pkg.durationMinutes);
+    if (times.length) days[date] = times;
+  }
+  return { month, days };
+}
+
+export interface CalendarBooking {
+  id: string;
+  start: string;
+  end: string;
+  status: BookingStatus;
+  customerName: string;
+  packageName: string;
+}
+
+export interface CalendarDay {
+  date: string;
+  /** standard = default hours (no custom schedule), custom = own slots, closed = unavailable. */
+  mode: "standard" | "custom" | "closed";
+  slots: Window[];
+  bookings: CalendarBooking[];
+  /** Inside the editable window (tomorrow … +180 days). */
+  editable: boolean;
+}
+
+/** Owner calendar for one month: schedule + that month's bookings. Caller must authorize. */
+export async function getStudioCalendar(studioId: string, month: string): Promise<CalendarDay[]> {
+  const dates = monthDates(month);
+  const [dayDocs, bookings] = await Promise.all([availabilityDocs(studioId, dates), bookingsOnDates(studioId, dates)]);
+  const { min, max } = bookableRange();
+  return dates.map((date) => {
+    const doc = dayDocs.get(date);
+    const { isClosed, open, source } = openWindows(doc);
+    return {
+      date,
+      mode: isClosed ? "closed" : source === "studio" ? "custom" : "standard",
+      slots: source === "studio" ? open : [],
+      bookings: bookings
+        .filter((b) => b.get("shootDate") === date)
+        .map((b) => ({
+          id: b.id,
+          start: b.get("startTime") as string,
+          end: b.get("endTime") as string,
+          status: b.get("bookingStatus") as BookingStatus,
+          customerName: b.get("customerName") as string,
+          packageName: b.get("packageSnapshot.name") as string,
+        }))
+        .sort((a, b) => a.start.localeCompare(b.start)),
+      editable: date >= min && date <= max,
+    };
+  });
+}
+
+function assertEditableDate(date: string) {
+  const { min, max } = bookableRange();
+  if (!isRealDate(date)) throw new ApiError(422, "VALIDATION_FAILED", "Invalid date.", { date: "Invalid date." });
+  if (date < min || date > max) {
+    throw new ApiError(422, "VALIDATION_FAILED", "Availability can be changed from tomorrow up to 6 months ahead.", {
+      date: "Choose a date between tomorrow and 6 months from now.",
+    });
+  }
+}
+
+/**
+ * Owner sets (input) or resets (null → standard hours) one day's availability.
+ * Runs under the studio-day booking lock, so it serializes with booking
+ * requests: a request can never slip in against a stale schedule, and the
+ * edit is refused if a pending/confirmed booking would fall outside the new
+ * open hours. Caller must have verified ownership (assertStudioOwner).
+ */
+export async function setDayAvailability(studioId: string, date: string, input: AvailabilityDayInput | null): Promise<CalendarDay["mode"]> {
+  assertEditableDate(date);
+  if (input) {
+    if (input.isClosed && input.slots.length) {
+      throw new ApiError(422, "VALIDATION_FAILED", "An unavailable day can't have time slots.", { slots: "Remove the time slots or keep the day available." });
+    }
+    if (!input.isClosed) {
+      const error = slotsError(input.slots);
+      if (error) throw new ApiError(422, "VALIDATION_FAILED", error, { slots: error });
+    }
+  }
+
+  const dayRef = studioSub(studioId, "availability").doc(date);
+  const slots = input && !input.isClosed ? [...input.slots].sort((a, b) => toMinutes(a.start) - toMinutes(b.start)) : [];
+  const next: Pick<AvailabilityDayDoc, "studioId" | "date" | "isClosed" | "slots"> | undefined = input
+    ? { studioId, date, isClosed: input.isClosed, slots: slots.map((s) => ({ ...s, status: "open", bookingId: null })) }
+    : undefined;
+
+  await db().runTransaction(async (tx) => {
+    const [, existing, current] = await Promise.all([tx.get(lockRef(studioId, date)), tx.get(bookingsFor(studioId, date)), tx.get(dayRef)]);
+    const { isClosed, open } = openWindows(next);
+    const stranded = activeWindows(existing.docs).filter(
+      (w) => isClosed || !open.some((o) => toMinutes(o.start) <= toMinutes(w.start) && toMinutes(w.end) <= toMinutes(o.end)),
+    );
+    if (stranded.length) {
+      const list = stranded.map((w) => `${w.start}–${w.end}`).join(", ");
+      throw new ApiError(
+        409,
+        "BOOKED_TIME",
+        `You have a booking at ${list} on this date. Keep that time available, or decline/cancel the booking first.`,
+      );
+    }
+    if (next) {
+      tx.set(dayRef, {
+        ...next,
+        createdAt: current.get("createdAt") ?? FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    } else if (current.exists) {
+      tx.delete(dayRef);
+    }
+    touchLock(tx, studioId, date);
+  });
+
+  return !next ? "standard" : next.isClosed ? "closed" : "custom";
 }
