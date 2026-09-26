@@ -2,6 +2,7 @@ import { PHOTOGRAPHY_CATEGORIES, type CategorySlug } from "@/config/categories";
 import { LOCATIONS, type LocationSlug } from "@/config/locations";
 import { MAX_SLOTS_PER_DAY } from "@/lib/booking/rules";
 import { BOOKING_ACTIONS, type BookingAction } from "@/lib/booking/transitions";
+import { NOTIFICATION_ID_RE } from "@/lib/notifications/types";
 import { COMMENT_MAX, COMMENT_MIN, RATING_MAX, RATING_MIN } from "@/lib/reviews/rules";
 import type { GalleryImageKind } from "@/types/models";
 
@@ -387,4 +388,32 @@ function slotList(max: number): (value: unknown) => { ok: true; value: Availabil
 export const availabilityDaySchema: Schema<AvailabilityDayInput> = {
   isClosed: bool(),
   slots: slotList(MAX_SLOTS_PER_DAY),
+};
+
+/* --------------------------------------------------------- notifications */
+
+export const MAX_NOTIFICATION_IDS = 50;
+
+export interface NotificationReadInput {
+  ids: string[] | null;
+  all: true | null;
+}
+
+/**
+ * POST /api/notifications/read — exactly one of:
+ *   { ids: [...] }  1–50 unique ids shaped like `{type}_{bookingId}`
+ *   { all: true }
+ * Unknown fields are rejected by `validate`; "both" or "neither" by the route.
+ */
+export const notificationReadSchema: Schema<NotificationReadInput> = {
+  ids: (value) => {
+    if (value === undefined) return { ok: true, value: null };
+    if (!Array.isArray(value) || value.length === 0 || value.length > MAX_NOTIFICATION_IDS) {
+      return { ok: false, error: `Send 1–${MAX_NOTIFICATION_IDS} notification ids.` };
+    }
+    if (!value.every((id) => typeof id === "string" && NOTIFICATION_ID_RE.test(id))) return { ok: false, error: "Invalid notification id." };
+    if (new Set(value).size !== value.length) return { ok: false, error: "Duplicate notification ids." };
+    return { ok: true, value: value as string[] };
+  },
+  all: (value) => (value === undefined ? { ok: true, value: null } : value === true ? { ok: true, value: true } : { ok: false, error: "Must be true." }),
 };

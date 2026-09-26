@@ -36,6 +36,9 @@ import {
   toMinutes,
   type Window,
 } from "./rules";
+import { queueBookingNotification } from "@/lib/notifications/service";
+import { TRANSITION_NOTIFICATION } from "@/lib/notifications/types";
+
 import { checkTransition, isExpiredPending, type BookingAction } from "./transitions";
 
 /**
@@ -55,6 +58,9 @@ import { checkTransition, isExpiredPending, type BookingAction } from "./transit
  *   booking transaction, which also reads and writes that customer's
  *   `customerLocks/{uid}` doc, so concurrent requests from one customer are
  *   serialized and can never exceed MAX_PENDING_PER_CUSTOMER.
+ * - Each booking event queues its in-app notification (booking_requested,
+ *   booking_confirmed, …) in the SAME transaction, so the event and its
+ *   notification commit together or not at all (src/lib/notifications).
  * - Every write for a studio-day first reads `bookingLocks/{studioId}_{date}`
  *   and writes it back. Firestore serializes transactions that touch the same
  *   document, so two concurrent requests can never both pass the overlap
@@ -217,6 +223,7 @@ export async function createBooking(user: CurrentUser, input: BookingCreateInput
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
     });
+    queueBookingNotification(tx, "booking_requested", bookingRef.id, booking as BookingDoc);
     touchLock(tx, input.studioId, input.shootDate);
     tx.set(
       customerLockRef(user.uid),
@@ -301,6 +308,7 @@ export async function transitionBooking(user: CurrentUser, bookingId: string, ac
       tx.update(studioRef(b.studioId), { "stats.completedBookings": FieldValue.increment(1) });
     }
     tx.update(ref, update);
+    queueBookingNotification(tx, TRANSITION_NOTIFICATION[action], bookingId, b);
     return to;
   });
 }

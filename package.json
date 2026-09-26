@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "test:rules": "node --test tests/firestore-rules.test.mjs",
-    "test:unit": "node --experimental-strip-types --no-warnings=ExperimentalWarning --test tests/booking-logic.test.mjs tests/review-logic.test.mjs",
+    "test:unit": "node --experimental-strip-types --no-warnings=ExperimentalWarning --test tests/booking-logic.test.mjs tests/review-logic.test.mjs tests/notification-logic.test.mjs",
     "admin:grant": "node --env-file-if-exists=.env.local scripts/grant-admin.mjs",
     "ratings:recompute": "node --env-file-if-exists=.env.local scripts/recompute-ratings.mjs",
     "test:api": "node --env-file-if-exists=.env.local --test --test-concurrency=1 tests/api-security.test.mjs"

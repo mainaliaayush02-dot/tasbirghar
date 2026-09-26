@@ -8,6 +8,7 @@ import { studioInternalRef, studioRef } from "@/lib/data/studios";
 import { toIso } from "@/lib/data/serialize";
 import { adminDb } from "@/lib/firebase/admin";
 import { collections } from "@/lib/firestore/paths";
+import { queueBookingNotification } from "@/lib/notifications/service";
 import type { ReviewSubmitInput } from "@/lib/validation/schemas";
 import type { BookingDoc, ReviewDoc, ReviewStatus, StudioDoc } from "@/types/models";
 
@@ -76,6 +77,8 @@ export async function submitReview(user: CurrentUser, bookingId: string, input: 
       };
       tx.create(ref, { ...review, createdAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() });
       tx.update(bookingRef(bookingId), { reviewedAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() });
+      // The studio learns a review is in; admins see it in the derived moderation queue.
+      queueBookingNotification(tx, "review_submitted", bookingId, b);
     });
   } catch (error) {
     // A concurrent submission committed first (gRPC ALREADY_EXISTS).

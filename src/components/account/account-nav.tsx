@@ -4,14 +4,18 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 
 import { LogoutButton } from "@/components/auth/logout-button";
+import { NotificationBell } from "@/components/notifications/notification-bell";
 
 const LINKS = [
   { href: "/account", label: "Account" },
   { href: "/account/bookings", label: "My bookings" },
 ] as const;
 
-/** Signed-in customer sub-navigation (the public header is cookie-free). */
-export function AccountNav() {
+/**
+ * Signed-in customer sub-navigation (the public header is cookie-free).
+ * `unread` is null for admins, who have no stored notifications.
+ */
+export function AccountNav({ unread }: { unread: number | null }) {
   const pathname = usePathname();
   return (
     <div className="border-b border-neutral-200 bg-white">
@@ -34,7 +38,10 @@ export function AccountNav() {
             );
           })}
         </ul>
-        <LogoutButton />
+        <div className="flex items-center gap-1">
+          {unread !== null && <NotificationBell href="/account/notifications" unread={unread} />}
+          <LogoutButton />
+        </div>
       </nav>
     </div>
   );

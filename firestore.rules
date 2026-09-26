@@ -67,6 +67,15 @@ service cloud.firestore {
         && onlyChanges(['displayName', 'phone', 'updatedAt']);
 
       allow delete: if false;
+
+      // In-app notifications. Created only by server code, in the same
+      // transaction as the booking/review event; marked read only through
+      // POST /api/notifications/read. A user can read (get/list) only their
+      // own; no client — not even the owner or an admin — can write them.
+      match /notifications/{notificationId} {
+        allow read: if isSelf(uid);
+        allow write: if false;
+      }
     }
 
     // -------------------------------------------------------------- studios

@@ -34,7 +34,10 @@ function Brand() {
   );
 }
 
-function NavList({ onNavigate }: { onNavigate?: () => void }) {
+/** Items needing admin attention, keyed by nav href (derived counts). */
+export type AdminAttention = Record<string, number>;
+
+function NavList({ onNavigate, attention }: { onNavigate?: () => void; attention: AdminAttention }) {
   const pathname = usePathname();
   return (
     <ul className="space-y-0.5">
@@ -54,6 +57,11 @@ function NavList({ onNavigate }: { onNavigate?: () => void }) {
             >
               <span className={active ? "text-brand-600" : "text-neutral-400"}>{icons[item.icon]}</span>
               {item.label}
+              {(attention[item.href] ?? 0) > 0 && (
+                <span data-attention={item.href} aria-label={`${attention[item.href]} waiting`} className="ml-auto rounded-full bg-brand-600 px-1.5 text-[11px] leading-5 font-semibold text-white">
+                  {attention[item.href]}
+                </span>
+              )}
             </Link>
           </li>
         );
@@ -150,10 +158,12 @@ function AccountMenu({ email, name }: { email: string | null; name: string }) {
 export function AdminShell({
   email,
   name,
+  attention,
   children,
 }: {
   email: string | null;
   name: string;
+  attention: AdminAttention;
   children: ReactNode;
 }) {
   const drawer = useRef<HTMLDialogElement>(null);
@@ -165,7 +175,7 @@ export function AdminShell({
       <aside className="sticky top-0 hidden h-dvh w-64 shrink-0 flex-col border-r border-neutral-200/80 bg-cream px-4 py-5 lg:flex">
         <Brand />
         <nav aria-label="Admin" className="mt-8 flex-1 overflow-y-auto">
-          <NavList />
+          <NavList attention={attention} />
         </nav>
         <p className="px-3 text-xs text-neutral-400">Discover. Book. Capture.</p>
       </aside>
@@ -189,7 +199,7 @@ export function AdminShell({
             </button>
           </div>
           <nav aria-label="Admin" className="mt-8">
-            <NavList onNavigate={() => drawer.current?.close()} />
+            <NavList onNavigate={() => drawer.current?.close()} attention={attention} />
           </nav>
         </div>
       </dialog>

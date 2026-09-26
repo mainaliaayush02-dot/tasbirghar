@@ -1727,6 +1727,235 @@ describe("Phase 4B-2: reviews and rating accounting", () => {
   });
 });
 
+/* ============================================= 8e. Phase 4B-3: in-app notifications */
+
+describe("Phase 4B-3: in-app notifications", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const inbox = async (user) => (await db.collection(`users/${user.uid}/notifications`).get()).docs;
+  const ofType = async (user, type) => (await inbox(user)).filter((d) => d.get("type") === type);
+  const list = (user) => call(user, "GET", "/api/notifications");
+  const read = (user, body) => call(user, "POST", "/api/notifications/read", body);
+  const book = (user, shootDate, startTime, extra = {}) =>
+    call(user, "POST", "/api/bookings", {
+      studioId: S.studioA, packageId: S.pkgA, shootDate, startTime,
+      customerName: "Notif Customer", customerPhone: "9811111166", customerNote: null, ...extra,
+    });
+  const act = (user, bookingId, action) => call(user, "POST", `/api/bookings/${bookingId}`, { action });
+  const seed = async (customer, fields) => {
+    const ref = db.collection("bookings").doc();
+    await ref.set({
+      customerId: customer.uid, studioId: S.studioA, studioOwnerId: S.alice.uid, packageId: S.pkgA, photographyCategory: "newborn",
+      shootDate: nepalToday(), startTime: "00:00", endTime: "02:00", timezone: "Asia/Kathmandu", customerName: "Notif Customer",
+      customerPhone: "+9779811111166", customerNote: null, packageSnapshot: { name: "Seeded", price: 1500000, durationMinutes: 120 },
+      studioSnapshot: { businessName: "Seeded Studio", slug: "seeded" }, paymentStatus: "unpaid", payoutStatus: "not_due", currency: "NPR",
+      grossAmount: 1500000, commissionRateBps: 800, commissionAmount: 120000, photographerNetAmount: 1380000,
+      bookingStatus: "confirmed", confirmedAt: new Date(), completedAt: null, cancelledAt: null, reviewedAt: null,
+      createdAt: new Date(), updatedAt: new Date(), ...fields,
+    });
+    return ref.id;
+  };
+  const B = {};
+
+  before(async () => {
+    [S.sam, S.tia, S.uma] = await Promise.all(
+      [["sam", "Sam Karki"], ["tia", "Tia Lama"], ["uma", "Uma Rai"]].map(([n, name]) =>
+        login(`${n}-${RUN}@example.com`, { signup: true, profile: { displayName: name, phone: null } }),
+      ),
+    );
+    assert.equal((await db.doc(`studios/${S.studioA}`).get()).get("listingStatus"), "published");
+    // Start from a known state: read everything Alice already has.
+    await read(S.alice, { all: true });
+  });
+
+  test("signed-out requests are refused", async () => {
+    assert.equal((await list(null)).status, 401);
+    assert.equal((await read(null, { all: true })).status, 401);
+  });
+
+  test("a booking request notifies the studio owner (not the customer), in the same transaction", async () => {
+    const res = await book(S.sam, plusDays(170), "09:00");
+    assert.equal(res.status, 201, JSON.stringify(res.json));
+    B.requested = res.json.bookingId;
+    const n = (await db.doc(`users/${S.alice.uid}/notifications/booking_requested_${B.requested}`).get()).data();
+    assert.ok(n, "studio owner notified");
+    assert.equal(n.type, "booking_requested");
+    assert.equal(n.bookingId, B.requested);
+    assert.equal(n.studioId, S.studioA);
+    assert.equal(n.readAt, null);
+    assert.ok(n.createdAt);
+    assert.deepEqual(Object.keys(n.data).sort(), ["customerName", "date", "packageName", "studioName", "time"]);
+    assert.equal(n.data.customerName, "Notif C.", "privacy-safe name, not the full name");
+    assert.deepEqual(Object.keys(n).sort(), ["bookingId", "createdAt", "data", "readAt", "reviewId", "studioId", "type"], "no stored title/message/link");
+    assert.equal((await inbox(S.sam)).length, 0, "the customer is not notified of their own request");
+    const api = await list(S.alice);
+    assert.equal(api.status, 200);
+    const item = api.json.items.find((i) => i.id === `booking_requested_${B.requested}`);
+    assert.equal(item.title, "New booking request");
+    assert.equal(item.href, "/dashboard/bookings?status=pending");
+    assert.equal(item.read, false);
+    assert.ok(api.json.unread >= 1);
+  });
+
+  test("every status change notifies the right recipient exactly once", async () => {
+    // confirm → customer
+    assert.equal((await act(S.alice, B.requested, "confirm")).status, 200);
+    assert.equal((await ofType(S.sam, "booking_confirmed")).length, 1);
+    // decline → customer
+    const d = (await book(S.sam, plusDays(171), "09:00")).json.bookingId;
+    assert.equal((await act(S.alice, d, "decline")).status, 200);
+    assert.ok((await db.doc(`users/${S.sam.uid}/notifications/booking_declined_${d}`).get()).exists);
+    // customer cancel → studio
+    const c = (await book(S.sam, plusDays(172), "09:00")).json.bookingId;
+    assert.equal((await act(S.sam, c, "cancel")).status, 200);
+    const cancelled = (await db.doc(`users/${S.alice.uid}/notifications/booking_cancelled_by_customer_${c}`).get()).data();
+    assert.equal(cancelled.data.customerName, "Notif C.");
+    assert.equal((await ofType(S.sam, "booking_cancelled_by_customer")).length, 0, "not sent to the actor");
+    // studio cancel (confirmed) → customer
+    assert.equal((await act(S.alice, B.requested, "studio_cancel")).status, 200);
+    const sc = (await db.doc(`users/${S.sam.uid}/notifications/booking_cancelled_by_studio_${B.requested}`).get()).data();
+    assert.ok(!("customerName" in sc.data), "customers never receive customer names");
+    // complete → customer
+    B.completed = await seed(S.sam);
+    assert.equal((await act(S.alice, B.completed, "complete")).status, 200);
+    assert.ok((await db.doc(`users/${S.sam.uid}/notifications/booking_completed_${B.completed}`).get()).exists);
+    const titles = (await list(S.sam)).json.items.map((i) => i.title);
+    for (const t of ["Your booking was confirmed", "Your booking was declined", "Booking cancelled by the studio", "Session completed"]) assert.ok(titles.includes(t), t);
+    assert.equal((await inbox(S.admin)).length, 0, "admins get no stored notifications");
+  });
+
+  test("repeated or concurrent actions never duplicate a notification", async () => {
+    const id = (await book(S.tia, plusDays(173), "09:00")).json.bookingId;
+    const results = await Promise.all([1, 2, 3, 4].map(() => act(S.alice, id, "confirm")));
+    assert.deepEqual(results.map((r) => r.status).sort(), [200, 409, 409, 409]);
+    assert.equal((await ofType(S.tia, "booking_confirmed")).length, 1);
+    assert.equal((await act(S.alice, id, "confirm")).status, 409);
+    assert.equal((await ofType(S.tia, "booking_confirmed")).length, 1, "a retry after success adds nothing");
+    assert.equal((await db.collection(`users/${S.alice.uid}/notifications`).where("bookingId", "==", id).get()).size, 1, "one booking_requested for the studio");
+  });
+
+  test("a failed operation leaves no notification behind (all-or-nothing)", async () => {
+    const before = (await inbox(S.alice)).length;
+    // Rejected inside the booking transaction: two customers race for one slot, closed day, stale request.
+    const race = await Promise.all([book(S.uma, plusDays(174), "15:00"), book(S.tia, plusDays(174), "15:00")]);
+    assert.deepEqual(race.map((r) => r.status).sort(), [201, 409]);
+    const winner = race.find((r) => r.status === 201).json.bookingId;
+    await db.doc(`studios/${S.studioA}/availability/${plusDays(175)}`).set({ studioId: S.studioA, date: plusDays(175), isClosed: true, slots: [] });
+    assert.equal((await book(S.uma, plusDays(175), "10:00")).status, 409, "closed day");
+    const after = await inbox(S.alice);
+    assert.equal(after.length, before + 1, "only the winning request notified the studio");
+    assert.ok(after.some((d) => d.id === `booking_requested_${winner}`));
+    // A refused transition (expired request) adds nothing for the customer.
+    const expired = await seed(S.uma, { bookingStatus: "pending", confirmedAt: null });
+    const beforeUma = (await inbox(S.uma)).length;
+    assert.equal((await act(S.alice, expired, "confirm")).status, 409);
+    assert.equal((await inbox(S.uma)).length, beforeUma);
+  });
+
+  test("a submitted review notifies the studio once (no per-admin copies)", async () => {
+    const results = await Promise.all([1, 2, 3].map(() => call(S.sam, "POST", `/api/bookings/${B.completed}/review`, { rating: 5, comment: "Lovely, calm session and wonderful photos of our baby." })));
+    assert.deepEqual(results.map((r) => r.status).sort(), [201, 409, 409]);
+    const n = (await db.doc(`users/${S.alice.uid}/notifications/review_submitted_${B.completed}`).get()).data();
+    assert.equal(n.type, "review_submitted");
+    assert.equal(n.reviewId, B.completed);
+    assert.equal((await ofType(S.alice, "review_submitted")).filter((d) => d.get("bookingId") === B.completed).length, 1);
+    assert.equal((await inbox(S.admin)).length, 0, "no admin notification documents");
+    const item = (await list(S.alice)).json.items.find((i) => i.id === `review_submitted_${B.completed}`);
+    assert.equal(item.title, "New review awaiting moderation");
+  });
+
+  test("users see and change only their own notifications", async () => {
+    const sams = (await list(S.sam)).json.items.map((i) => i.id);
+    const tias = (await list(S.tia)).json.items.map((i) => i.id);
+    assert.ok(sams.length > 0 && tias.length > 0);
+    assert.equal(sams.filter((id) => tias.includes(id)).length, 0, "no overlap between users");
+    const target = sams.find((id) => id.startsWith("booking_completed_"));
+    const res = await read(S.tia, { ids: [target] });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.updated, 0, "someone else's id simply doesn't match");
+    assert.equal((await db.doc(`users/${S.sam.uid}/notifications/${target}`).get()).get("readAt"), null, "still unread for its owner");
+    assert.equal((await read(S.alice, { ids: [target] })).json.updated, 0, "not even the studio owner");
+  });
+
+  test("mark selected read, then mark all read; unread counts follow", async () => {
+    const start = await list(S.sam);
+    const unread = start.json.items.filter((i) => !i.read);
+    assert.ok(unread.length >= 3);
+    assert.equal(start.json.unread, unread.length);
+    const res = await read(S.sam, { ids: [unread[0].id, unread[1].id] });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.updated, 2);
+    assert.equal(res.json.unread, start.json.unread - 2);
+    assert.ok((await db.doc(`users/${S.sam.uid}/notifications/${unread[0].id}`).get()).get("readAt"), "readAt set by the server");
+    assert.equal((await read(S.sam, { ids: [unread[0].id] })).json.updated, 0, "already read");
+    const all = await read(S.sam, { all: true });
+    assert.equal(all.json.updated, start.json.unread - 2);
+    assert.equal(all.json.unread, 0);
+    const after = await list(S.sam);
+    assert.equal(after.json.unread, 0);
+    assert.ok(after.json.items.every((i) => i.read));
+    assert.equal((await read(S.sam, { all: true })).json.updated, 0);
+  });
+
+  test("mark-read requests are validated strictly (no arbitrary fields, capped batches)", async () => {
+    const ok = `booking_confirmed_${B.requested}`;
+    for (const [label, body] of [
+      ["empty body", {}],
+      ["both ids and all", { ids: [ok], all: true }],
+      ["all false", { all: false }],
+      ["all as string", { all: "true" }],
+      ["empty ids", { ids: [] }],
+      ["ids not a list", { ids: ok }],
+      ["too many ids", { ids: Array.from({ length: 51 }, (_, i) => `booking_confirmed_x${i}`) }],
+      ["malformed id", { ids: ["booking_confirmed_a/b"] }],
+      ["unknown type prefix", { ids: [`booking_expired_${B.requested}`] }],
+      ["path traversal", { ids: ["../../users/x"] }],
+      ["duplicate ids", { ids: [ok, ok] }],
+      ["extra field", { all: true, uid: S.sam.uid }],
+      ["forged recipient", { ids: [ok], userId: S.tia.uid }],
+      ["readAt injection", { all: true, readAt: null }],
+    ]) {
+      assert.equal((await read(S.sam, body)).status, 422, label);
+    }
+    assert.equal((await read(S.sam, { ids: Array.from({ length: 50 }, (_, i) => `booking_confirmed_x${i}`) })).status, 200, "50 is the cap");
+    const cross = await call(S.sam, "POST", "/api/notifications/read", { all: true }, { Origin: "https://evil.example" });
+    assert.equal(cross.status, 403, "same-origin enforced");
+  });
+
+  test("the list returns the latest 30, newest first, with the full unread count", async () => {
+    const batch = db.batch();
+    for (let i = 0; i < 35; i++) {
+      batch.set(db.doc(`users/${S.uma.uid}/notifications/booking_confirmed_order${String(i).padStart(2, "0")}`), {
+        type: "booking_confirmed", bookingId: `order${String(i).padStart(2, "0")}`, studioId: S.studioA, reviewId: null,
+        data: { studioName: "Order Studio", date: plusDays(30), time: "10:00" }, readAt: null, createdAt: new Date(Date.UTC(2026, 0, 1, 0, i)),
+      });
+    }
+    await batch.commit();
+    const res = await list(S.uma);
+    assert.equal(res.json.items.length, 30);
+    const times = res.json.items.map((i) => i.createdAt);
+    assert.deepEqual(times, [...times].sort().reverse(), "newest first");
+    assert.ok(res.json.items.every((i) => Object.keys(i).sort().join() === "body,createdAt,href,id,read,title,type"), "rendered fields only");
+    assert.ok(res.json.unread >= 35, "unread counts beyond the page");
+    assert.equal(res.json.items.some((i) => i.id === "booking_confirmed_order00"), false, "oldest are beyond the page");
+  });
+
+  test("notification pages and indicators render for their owners", async () => {
+    const acct = await page("/account/notifications", S.sam);
+    assert.equal(acct.status, 200);
+    assert.match(acct.html, /Your booking was confirmed/);
+    const dash = await page("/dashboard/notifications", S.alice);
+    assert.equal(dash.status, 200);
+    assert.match(dash.html, /New review awaiting moderation/);
+    assert.match((await page("/dashboard", S.alice)).html, /data-notification-bell/);
+    assert.match((await page("/account/bookings", S.uma)).html, /data-unread-count="\d+"/, "unread badge in account nav");
+    assert.equal((await page("/account/notifications", null)).status, 307, "signed out → login");
+    assert.equal((await page("/dashboard/notifications", S.sam)).status, 307, "customer can't open the studio page");
+    const adminHome = await page("/admin", S.admin);
+    assert.match(adminHome.html, /data-attention="\/admin\/reviews"/, "derived review-queue badge for admins");
+    assert.doesNotMatch((await page("/account", S.admin)).html, /data-notification-bell/, "no bell for admins");
+  });
+});
+
 /* ============================================================== 9. logout */
 
 describe("logout", () => {

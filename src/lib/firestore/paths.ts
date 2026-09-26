@@ -31,6 +31,9 @@ export function studioSubcollectionPath(studioId: string, sub: StudioSubcollecti
   return `${collections.studios}/${studioId}/${sub}`;
 }
 
+/** users/{uid}/notifications — server-written in-app notifications (see src/lib/notifications). */
+export const USER_NOTIFICATIONS = "notifications";
+
 /** Private, server-written studio sub-documents (see StudioContactDoc / StudioInternalDoc). */
 export const STUDIO_PRIVATE = "private";
 export const STUDIO_CONTACT_DOC = "contact";

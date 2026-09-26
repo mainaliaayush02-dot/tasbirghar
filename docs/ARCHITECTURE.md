@@ -172,6 +172,7 @@ bookings/{bookingId}                        BookingDoc
 reviews/{bookingId}                         ReviewDoc      (doc id = bookingId → one verified review per booking)
 bookingLocks/{studioId}_{YYYY-MM-DD}        server-only lock serializing a studio-day's booking/availability writes
 customerLocks/{uid}                         server-only lock serializing one customer's new requests (4B-1)
+users/{uid}/notifications/{type}_{bookingId} in-app notification (4B-3): server-written, owner read-only
 ```
 
 The full types are in `src/types/models.ts`. Collection names are in `src/lib/firestore/paths.ts`.
@@ -496,6 +497,54 @@ Concurrent or repeated submissions therefore produce exactly one review; the res
 
 ---
 
+## 6c. In-app notifications (Phase 4B-3)
+
+**Model.** `users/{uid}/notifications/{notificationId}`, one document per event. The id is **deterministic**: `{type}_{bookingId}` (e.g. `booking_confirmed_Ab12…`). Fields:
+- `type`: a fixed enum;
+- `bookingId`, `studioId`, and `reviewId` (for reviews; otherwise null);
+- `data`: a validated display snapshot of `studioName`, `customerName` (privacy-safe, and only for studio recipients), `packageName`, `date` and `time`;
+- `readAt` (null until read) and `createdAt`.
+
+No title, message or link is stored: `renderNotification` (`src/lib/notifications/types.ts`) generates them from the type, and they're never accepted from a client.
+
+**Events and recipients** (`NOTIFICATION_AUDIENCE`, `TRANSITION_NOTIFICATION`):
+
+| Event | Type | Recipient | Opens |
+| --- | --- | --- | --- |
+| customer requests a booking | `booking_requested` | studio owner | `/dashboard/bookings?status=pending` |
+| studio confirms | `booking_confirmed` | customer | `/account/bookings/{id}` |
+| studio declines | `booking_declined` | customer | `/account/bookings/{id}` |
+| customer cancels | `booking_cancelled_by_customer` | studio owner | `/dashboard/bookings?status=cancelled` |
+| studio cancels | `booking_cancelled_by_studio` | customer | `/account/bookings/{id}` |
+| studio completes | `booking_completed` | customer | `/account/bookings/{id}` |
+| customer submits a review | `review_submitted` | studio owner | `/dashboard/bookings?status=completed` |
+
+Expiry is derived (4B-1), so **no** notification is created because time passed. Reminders are dashboard prompts, not stored notifications.
+
+**Transactional, exactly once.** `queueBookingNotification(tx, …)` (`src/lib/notifications/service.ts`) is called inside the same Firestore transaction as the booking create, the status change or the review submission. It uses `tx.create` on the deterministic id, and the recipient uid comes from the booking (`customerId` / `studioOwnerId`), never from a request. So:
+- the event and its notification commit together or not at all (a refused or raced operation leaves nothing behind);
+- retries and repeated or concurrent actions can't duplicate it: the transition table refuses a repeat, and the id is unique per event.
+
+**Reading and marking read.**
+- `GET /api/notifications`: the signed-in user's latest 30 (newest first), rendered, plus the unread count.
+- `POST /api/notifications/read`: `{ ids: [...] }` (1–50 unique ids matching `{type}_{bookingId}`) or `{ all: true }` (up to 500 per call). The request is validated strictly, and any other field or both/neither form returns 422.
+
+Both routes are scoped to `users/{sessionUid}/notifications`, so one user's ids never match another user's documents. Unknown ids are ignored and nothing is created. Marking read happens only through this API.
+
+**Rules.** `match /users/{uid}/notifications/{id}`: `allow read: if isSelf(uid)` and `allow write: if false`. Other users, anonymous clients and admins can't read an inbox, and nobody can create, update or delete notifications from the client. All app reads go through the server anyway.
+
+**Indexes.** None added. The list is `orderBy(createdAt)` and the unread count is `where(readAt == null)`, both single-field indexes on the subcollection.
+
+**UI.**
+- **Customers:** a bell with an unread badge in the account nav, and `/account/notifications`.
+- **Photographers:** a bell in the dashboard header, a "Notifications" nav item, and `/dashboard/notifications`.
+- Opening an item marks it read, then navigates. Each item has "Mark read", and there's "Mark all as read" and an empty state ("You're all caught up").
+- **Admins have no stored notifications and no bell.** The admin nav shows derived badges instead (`adminAttention()`): pending applications and reviews awaiting moderation, from count queries.
+
+**Limits.** No email, SMS or push. Old notifications aren't pruned (bounded by one per booking event). The page shows the latest 30.
+
+---
+
 ## 7. Money and commission model
 
 **Decision: all amounts are integers in minor units (paisa, where 1 NPR = 100 paisa). Rates are integers in basis points.**
@@ -561,12 +610,12 @@ Local values go in `.env.local`, which is gitignored. Production and preview val
 
 ### Firestore rules: what clients may do
 
-`firestore.rules` is deny-by-default and is covered by `tests/firestore-rules.test.mjs` (132 emulator tests). Client updates use **field allowlists**, so any field not listed is immutable from the client SDK.
+`firestore.rules` is deny-by-default and is covered by `tests/firestore-rules.test.mjs` (139 emulator tests). Client updates use **field allowlists**, so any field not listed is immutable from the client SDK.
 
 | Actor | Allowed | Everything else |
 | --- | --- | --- |
 | Anyone (signed out) | Read published studios and their portfolio, gallery, packages and availability. `get` a single `studioSlugs/{slug}`. (Published reviews reach the public only through the server-rendered studio page, not Firestore.) | Denied, including draft studios, listing slugs and every `studios/{id}/private/*` doc |
-| Signed-in user (customer) | Create own `users/{uid}` with `role: "customer"`, `studioId: null`, `photo: null`. Read own user doc. Update own `displayName`, `phone`, `updatedAt`. Read own bookings and own review documents. | Denied, including other customers' reviews (published or not) |
+| Signed-in user (customer) | Create own `users/{uid}` with `role: "customer"`, `studioId: null`, `photo: null`. Read own user doc and own `users/{uid}/notifications` (read-only). Update own `displayName`, `phone`, `updatedAt`. Read own bookings and own review documents. | Denied, including other customers' reviews (published or not) |
 | Photographer (owner: `users/{uid}.studioId` equals the studio id) | `get` own `private/contact` (not `private/internal`). Update own studio: `businessName`, `description`, `location` (keys `city`, `area`, `geo` only), `categories`, `facilities`, `props`, `updatedAt`. Portfolio: update `caption`, `category`, `sortOrder`, `isFeatured`, or delete. Gallery: update `caption`, `sortOrder`, or delete. Packages: create with `images: []`, NPR and an integer price; update details and price; delete. Read own availability (writes go through the owner API since Phase 4A). Read bookings where `studioOwnerId` is the photographer's uid. | Denied, including every other studio |
 | Admin (claim) | **Read** users, studios (including drafts) and their subcollections, `private/contact` and `private/internal` (single `get`), bookings and reviews. | **All client writes denied.** Admin mutations (moderation, commission, role grants) go through server routes using the Admin SDK. |
 | Server (Admin SDK) | Everything, since it bypasses rules: studio creation and slug reservation, `private/contact` and `private/internal`, availability, statuses, commission, stats, `startingPrice`, all `MediaAsset` fields, portfolio and gallery creation, package images, role claims and mirror, bookings, reviews. | n/a |

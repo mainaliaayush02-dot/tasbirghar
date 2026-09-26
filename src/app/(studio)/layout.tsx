@@ -1,9 +1,11 @@
 import Link from "next/link";
 
 import { LogoutButton } from "@/components/auth/logout-button";
+import { NotificationBell } from "@/components/notifications/notification-bell";
 import { DashboardMobileNav, DashboardSidebar } from "@/components/dashboard/dashboard-nav";
 import { BrandLogo } from "@/components/public/brand-logo";
 import { requireUser } from "@/lib/auth/current-user";
+import { unreadCount } from "@/lib/notifications/service";
 import { noIndexMetadata } from "@/lib/seo";
 
 /**
@@ -15,6 +17,7 @@ export const metadata = noIndexMetadata;
 
 export default async function StudioLayout({ children }: { children: React.ReactNode }) {
   const user = await requireUser("dashboard", "/dashboard");
+  const unread = await unreadCount(user.uid);
 
   return (
     <div className="flex flex-1 flex-col bg-neutral-50">
@@ -26,6 +29,7 @@ export default async function StudioLayout({ children }: { children: React.React
           </Link>
           <div className="flex min-w-0 items-center gap-3">
             <span className="hidden truncate text-sm text-neutral-500 sm:inline">{user.email}</span>
+            <NotificationBell href="/dashboard/notifications" unread={unread} />
             <LogoutButton />
           </div>
         </div>

@@ -1,5 +1,7 @@
 import { AccountNav } from "@/components/account/account-nav";
 import { SiteHeader } from "@/components/site-header";
+import { getCurrentUser } from "@/lib/auth/current-user";
+import { unreadCount } from "@/lib/notifications/service";
 import { noIndexMetadata } from "@/lib/seo";
 
 /**
@@ -8,11 +10,14 @@ import { noIndexMetadata } from "@/lib/seo";
  */
 export const metadata = noIndexMetadata;
 
-export default function CustomerLayout({ children }: { children: React.ReactNode }) {
+export default async function CustomerLayout({ children }: { children: React.ReactNode }) {
+  // Admins have no stored notifications (their queues are derived counts).
+  const user = await getCurrentUser();
+  const unread = user && user.role !== "admin" ? await unreadCount(user.uid) : null;
   return (
     <div className="flex flex-1 flex-col bg-neutral-50">
       <SiteHeader />
-      <AccountNav />
+      <AccountNav unread={unread} />
       <div className="mx-auto w-full max-w-3xl flex-1 px-4 py-8 sm:px-6">{children}</div>
     </div>
   );

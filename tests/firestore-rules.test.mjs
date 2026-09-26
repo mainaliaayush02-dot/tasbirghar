@@ -1028,3 +1028,67 @@ describe("review documents: private to their customer and admins (Phase 4B-2)", 
     await assertFails(updateDoc(ref(photographer("pa"), "studios/studioA"), { stats: { ratingAverage: 5, reviewCount: 99, ratingSum: 495, portfolioCount: 1, completedBookings: 3 } }));
   });
 });
+
+/* ------------------------------------------------ notifications (Phase 4B-3) */
+
+describe("in-app notifications: owner read-only, server-written (Phase 4B-3)", () => {
+  const notif = (type, bookingId, extra = {}) => ({
+    type, bookingId, studioId: "studioA", reviewId: null,
+    data: { studioName: "Studio studio-a", date: "2026-10-01", time: "10:00" },
+    readAt: null, createdAt: "2026-09-01", ...extra,
+  });
+  const A1 = "users/alice/notifications/booking_confirmed_b1";
+  const B1 = "users/bob/notifications/booking_declined_b2";
+
+  beforeEach(async () => {
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      const db = ctx.firestore();
+      await setDoc(doc(db, A1), notif("booking_confirmed", "b1"));
+      await setDoc(doc(db, "users/alice/notifications/booking_completed_b1"), notif("booking_completed", "b1", { readAt: "2026-09-02" }));
+      await setDoc(doc(db, B1), notif("booking_declined", "b2"));
+      await setDoc(doc(db, "users/pa/notifications/booking_requested_b1"), notif("booking_requested", "b1"));
+    });
+  });
+
+  test("a user CAN read and list their own notifications", async () => {
+    await assertSucceeds(getDoc(ref(customer("alice"), A1)));
+    const snap = await assertSucceeds(getDocs(collection(customer("alice"), "users/alice/notifications")));
+    assert.equal(snap.size, 2);
+    await assertSucceeds(getDocs(query(collection(customer("alice"), "users/alice/notifications"), where("readAt", "==", null))));
+    await assertSucceeds(getDoc(ref(photographer("pa"), "users/pa/notifications/booking_requested_b1")));
+  });
+  test("another user cannot read or list someone else's notifications", async () => {
+    await assertFails(getDoc(ref(customer("bob"), A1)));
+    await assertFails(getDocs(collection(customer("bob"), "users/alice/notifications")));
+    await assertFails(getDoc(ref(photographer("pa"), A1)));
+    await assertFails(getDocs(collection(photographer("pb"), "users/pa/notifications")));
+    await assertFails(getDoc(ref(customer("alice"), B1)));
+  });
+  test("anonymous users cannot read notifications", async () => {
+    await assertFails(getDoc(ref(anon(), A1)));
+    await assertFails(getDocs(collection(anon(), "users/alice/notifications")));
+  });
+  test("admins get no client access to anyone's notifications (no stored admin inbox)", async () => {
+    await assertFails(getDoc(ref(admin(), A1)));
+    await assertFails(getDocs(collection(admin(), "users/alice/notifications")));
+  });
+  test("cross-user collection-group queries are denied", async () => {
+    await assertFails(getDocs(collectionGroup(customer("alice"), "notifications")));
+    await assertFails(getDocs(query(collectionGroup(anon(), "notifications"), where("type", "==", "booking_confirmed"))));
+  });
+  test("nobody can create, update (incl. marking read) or delete notifications from the client", async () => {
+    for (const db of [anon(), customer("alice"), customerWithClaim("alice"), customer("bob"), photographer("pa"), admin()]) {
+      await assertFails(setDoc(ref(db, "users/alice/notifications/booking_confirmed_forged"), notif("booking_confirmed", "forged")));
+      await assertFails(updateDoc(ref(db, A1), { readAt: "2026-09-03" }));
+      await assertFails(updateDoc(ref(db, A1), { type: "booking_completed" }));
+      await assertFails(deleteDoc(ref(db, A1)));
+    }
+    // Not even into their own inbox.
+    await assertFails(setDoc(ref(customer("bob"), "users/bob/notifications/booking_confirmed_x"), notif("booking_confirmed", "x")));
+  });
+  test("the users/{uid} profile rules are unchanged", async () => {
+    await assertFails(updateDoc(ref(customer("alice"), "users/alice"), { role: "admin" }));
+    await assertFails(getDoc(ref(customer("bob"), "users/alice")));
+    await assertSucceeds(getDoc(ref(customer("alice"), "users/alice")));
+  });
+});

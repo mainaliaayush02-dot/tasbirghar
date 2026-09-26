@@ -679,3 +679,17 @@ export async function listAdmins() {
     lastSignInAt: auth.get(d.id)?.lastSignInAt ?? null,
   }));
 }
+
+/* ============================================================ attention */
+
+/**
+ * Admin "notifications" are derived, never stored: counts of the queues that
+ * need action (single-field count queries).
+ */
+export async function adminAttention(): Promise<Record<string, number>> {
+  const [applications, reviews] = await Promise.all([
+    db().collection(collections.photographerApplications).where("status", "==", "pending").count().get(),
+    db().collection(collections.reviews).where("status", "==", "pending_moderation").count().get(),
+  ]);
+  return { "/admin/applications": applications.data().count, "/admin/reviews": reviews.data().count };
+}
