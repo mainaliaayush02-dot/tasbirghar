@@ -79,3 +79,8 @@ export function formatDay(date: string, style: "short" | "long" = "short"): stri
     year: "numeric",
   });
 }
+
+/** A day's hours for display: "10:00 AM – 1:00 PM, 2:00 PM – 6:00 PM" or "Closed". */
+export function describeHours(h: { closed: boolean; slots: { start: string; end: string }[] }): string {
+  return h.closed ? "Closed" : h.slots.map((s) => formatTimeRange(s.start, s.end)).join(", ");
+}

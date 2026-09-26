@@ -4,10 +4,11 @@ import { AvailabilityCalendar, LEGEND } from "@/components/availability/calendar
 import { DayEditor } from "@/components/availability/day-editor";
 import { buttonClass } from "@/components/ui/button";
 import { Card, PageHeader } from "@/components/ui/feedback";
-import { addMonths, bookableRange, isRealDate, MONTH_RE, nepalToday } from "@/lib/booking/rules";
-import { getStudioCalendar } from "@/lib/booking/service";
+import { addMonths, bookableRange, DEFAULT_CLOSE, DEFAULT_OPEN, isRealDate, MONTH_RE, nepalToday, WEEKDAY_KEYS, WEEKDAY_LABELS } from "@/lib/booking/rules";
+import { getStudioCalendar, getWeeklyHours } from "@/lib/booking/service";
 import { requireStudio } from "@/lib/data/dashboard";
 import { listPackages } from "@/lib/data/studios";
+import { describeHours } from "@/lib/format";
 
 export const metadata = { title: "Availability" };
 
@@ -22,7 +23,7 @@ export default async function AvailabilityPage({ searchParams }: PageProps<"/das
   const requested = typeof sp.month === "string" && MONTH_RE.test(sp.month) ? sp.month : thisMonth;
   const month = requested < addMonths(thisMonth, -1) ? addMonths(thisMonth, -1) : requested > max.slice(0, 7) ? max.slice(0, 7) : requested;
 
-  const [days, packages] = await Promise.all([getStudioCalendar(studio.id, month), listPackages(studio.id)]);
+  const [days, packages, weekly] = await Promise.all([getStudioCalendar(studio.id, month), listPackages(studio.id), getWeeklyHours(studio.id)]);
   const dateParam = typeof sp.date === "string" && isRealDate(sp.date) && sp.date.startsWith(month) ? sp.date : null;
   const selected = dateParam ?? (today.startsWith(month) ? (min.startsWith(month) ? min : today) : `${month}-01`);
   const day = days.find((d) => d.date === selected)!;
@@ -42,6 +43,30 @@ export default async function AvailabilityPage({ searchParams }: PageProps<"/das
         title="Availability"
         description="Choose which days and times families can book. Existing bookings always keep their time."
       />
+      <Card
+        className="mb-6"
+        title="Weekly hours"
+        description={weekly ? "Your standard hours for each weekday." : `Not set — every day uses ${describeHours({ closed: false, slots: [{ start: DEFAULT_OPEN, end: DEFAULT_CLOSE }] })}.`}
+        actions={
+          <Link href="/dashboard/availability/weekly" className={buttonClass("secondary", "sm")}>
+            {weekly ? "Edit weekly hours" : "Set weekly hours"}
+          </Link>
+        }
+      >
+        {weekly ? (
+          <dl className="grid gap-x-6 gap-y-1.5 text-sm sm:grid-cols-2" data-weekly-summary>
+            {WEEKDAY_KEYS.map((k) => (
+              <div key={k} className="flex justify-between gap-3">
+                <dt className="text-neutral-500">{WEEKDAY_LABELS[k]}</dt>
+                <dd className={`text-right ${weekly[k].closed ? "text-neutral-400" : "text-neutral-900"}`}>{describeHours(weekly[k])}</dd>
+              </div>
+            ))}
+          </dl>
+        ) : (
+          <p className="text-sm text-neutral-600">Set opening hours once for each weekday; change individual dates below.</p>
+        )}
+      </Card>
+
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_380px]">
         <Card>
           <div className="mb-4 flex items-center justify-between gap-2">
@@ -89,7 +114,13 @@ export default async function AvailabilityPage({ searchParams }: PageProps<"/das
           </p>
         </Card>
         <Card className="xl:self-start">
-          <DayEditor key={day.date} studioId={studio.id} day={day} packageDurations={activeDurations} />
+          <DayEditor
+            key={day.date}
+            studioId={studio.id}
+            day={day}
+            monthDays={days.map((d) => ({ date: d.date, editable: d.editable }))}
+            packageDurations={activeDurations}
+          />
         </Card>
       </div>
     </>

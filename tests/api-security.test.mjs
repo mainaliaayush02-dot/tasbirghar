@@ -1730,7 +1730,6 @@ describe("Phase 4B-2: reviews and rating accounting", () => {
 /* ============================================= 8e. Phase 4B-3: in-app notifications */
 
 describe("Phase 4B-3: in-app notifications", () => {
-  const DAY = 24 * 60 * 60 * 1000;
   const inbox = async (user) => (await db.collection(`users/${user.uid}/notifications`).get()).docs;
   const ofType = async (user, type) => (await inbox(user)).filter((d) => d.get("type") === type);
   const list = (user) => call(user, "GET", "/api/notifications");
@@ -1953,6 +1952,331 @@ describe("Phase 4B-3: in-app notifications", () => {
     const adminHome = await page("/admin", S.admin);
     assert.match(adminHome.html, /data-attention="\/admin\/reviews"/, "derived review-queue badge for admins");
     assert.doesNotMatch((await page("/account", S.admin)).html, /data-notification-bell/, "no bell for admins");
+  });
+});
+
+/* ============================================= 8f. Phase 4B-4: weekly hours */
+
+describe("Phase 4B-4: weekly hours and bulk availability", () => {
+  const W = {};
+  const KEYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+  const slot = (start, end) => ({ start, end });
+  const openDay = (...slots) => ({ closed: false, slots });
+  const CLOSED = { closed: true, slots: [] };
+  const week = (overrides = {}) => ({ ...Object.fromEntries(KEYS.map((k) => [k, openDay(slot("09:00", "17:00"))])), ...overrides });
+  const putWeekly = (user, days, studioId = W.studioId, headers) => call(user, "PUT", `/api/studios/${studioId}/weekly-hours`, { days }, headers);
+  const delWeekly = (user, studioId = W.studioId) => call(user, "DELETE", `/api/studios/${studioId}/weekly-hours`);
+  const bulk = (user, body, studioId = W.studioId, headers) => call(user, "PUT", `/api/studios/${studioId}/availability/bulk`, body, headers);
+  const av = (user, date, body, method = "PUT") => call(user, method, `/api/studios/${W.studioId}/availability/${date}`, body);
+  const dayView = (date) => call(null, "GET", `/api/studios/${W.studioId}/availability?date=${date}`);
+  const monthView = (date) => call(null, "GET", `/api/studios/${W.studioId}/availability?month=${date.slice(0, 7)}&packageId=${W.pkg}`);
+  const book = (user, shootDate, startTime) =>
+    call(user, "POST", "/api/bookings", {
+      studioId: W.studioId, packageId: W.pkg, shootDate, startTime,
+      customerName: "Weekly Customer", customerPhone: "9811111177", customerNote: null,
+    });
+  const act = (user, bookingId, action) => call(user, "POST", `/api/bookings/${bookingId}`, { action });
+  const stored = async () => (await db.doc(`studios/${W.studioId}`).get()).get("weeklyHours") ?? null;
+  const dayDoc = async (date) => (await db.doc(`studios/${W.studioId}/availability/${date}`).get()).data();
+  const weekdayOf = (date) => KEYS[new Date(`${date}T00:00:00Z`).getUTCDay()];
+  /** The n-th date (0-based) of a weekday at least `from` days ahead. */
+  const nth = (key, n, from = 7) => {
+    let i = from;
+    while (weekdayOf(plusDays(i)) !== key) i++;
+    return plusDays(i + 7 * n);
+  };
+
+  before(async () => {
+    // A separate published studio seeded in the EMULATOR (no uploads), so these
+    // weekly hours never affect Studio A's fixtures.
+    const email = `wes-${RUN}@example.com`;
+    const { localId: uid } = await identity("accounts:signUp", { email, password: PASSWORD });
+    await adminAuth.setCustomUserClaims(uid, { role: "photographer" });
+    const sRef = db.collection("studios").doc();
+    W.studioId = sRef.id;
+    const slug = `weekly-studio-${RUN}`;
+    const now = new Date();
+    await db.doc(`users/${uid}`).set({ uid, role: "photographer", displayName: "Wes Thapa", email, phone: null, photo: null, studioId: W.studioId, createdAt: now, updatedAt: now });
+    await sRef.set({
+      businessName: "Weekly Hours Studio", slug, description: "A studio used to test weekly opening hours in the emulator.",
+      location: { city: "kathmandu", area: "Baneshwor", geo: null }, yearsOfExperience: 3, team: null, highlights: null, categories: ["newborn"],
+      profileImage: null, coverImage: null, facilities: [], props: [], verificationStatus: "verified", listingStatus: "published", publishedAt: now,
+      startingPrice: 1000000, currency: "NPR", stats: { ratingAverage: 0, reviewCount: 0, ratingSum: 0, portfolioCount: 0, completedBookings: 0 },
+      createdAt: now, updatedAt: now,
+    });
+    await sRef.collection("private").doc("internal").set({ ownerId: uid, commissionRateBps: 800, lastModeration: null, createdAt: now, updatedAt: now });
+    await sRef.collection("private").doc("contact").set({ phone: "+9779812345000", email: "wes-private@example.com", address: "Secret Lane 4", website: null, instagram: null, updatedAt: now });
+    await db.doc(`studioSlugs/${slug}`).set({ studioId: W.studioId });
+    const pRef = sRef.collection("packages").doc();
+    await pRef.set({
+      studioId: W.studioId, name: "Mini Session", description: "One-hour session.", category: "newborn", price: 1000000, currency: "NPR",
+      durationMinutes: 60, editedPhotos: 10, includes: [], images: [], isActive: true, sortOrder: 0, createdAt: now, updatedAt: now,
+    });
+    W.pkg = pRef.id;
+    W.wes = await login(email);
+    [W.kim, W.lee] = await Promise.all(
+      ["kim", "lee"].map((n) => login(`weekly-${n}-${RUN}@example.com`, { signup: true, profile: { displayName: n, phone: null } })),
+    );
+  });
+
+  test("only the studio owner can change weekly hours or bulk-edit days", async () => {
+    const days = week();
+    const body = { dates: [plusDays(30)], hours: { isClosed: true, slots: [] } };
+    assert.equal((await putWeekly(null, days)).status, 401);
+    assert.equal((await delWeekly(null)).status, 401);
+    assert.equal((await bulk(null, body)).status, 401);
+    for (const user of [W.kim, S.admin2 ?? S.admin]) {
+      assert.equal((await putWeekly(user, days)).status, 403, "not a photographer");
+      assert.equal((await bulk(user, body)).status, 403);
+    }
+    assert.equal((await putWeekly(S.alice, days)).status, 403, "another studio's owner");
+    assert.equal((await delWeekly(S.alice)).status, 403);
+    assert.equal((await bulk(S.alice, body)).status, 403);
+    assert.equal((await putWeekly(W.wes, days, S.studioA)).status, 403, "cannot edit Studio A");
+    assert.equal((await bulk(W.wes, body, S.studioA)).status, 403);
+    assert.equal((await putWeekly(W.wes, days, "noSuchStudio123")).status, 404);
+    assert.equal((await putWeekly(W.wes, days, W.studioId, { Origin: "https://evil.example" })).status, 403, "cross-origin");
+    assert.equal((await bulk(W.wes, body, W.studioId, { Origin: "https://evil.example" })).status, 403);
+    assert.equal(await stored(), null, "nothing written");
+    assert.equal(await dayDoc(plusDays(30)), undefined);
+    assert.equal((await db.doc(`studios/${S.studioA}`).get()).get("weeklyHours") ?? null, null, "Studio A untouched");
+  });
+
+  test("invalid weekly hours are rejected server-side", async () => {
+    const { sat, ...six } = week();
+    void sat;
+    for (const [label, days] of [
+      ["missing weekday", six],
+      ["extra key", { ...week(), holiday: CLOSED }],
+      ["extra day field", week({ mon: { closed: false, slots: [slot("09:00", "17:00")], note: "x" } })],
+      ["closed with slots", week({ tue: { closed: true, slots: [slot("09:00", "10:00")] } })],
+      ["open without slots", week({ wed: { closed: false, slots: [] } })],
+      ["overlap", week({ thu: openDay(slot("09:00", "12:00"), slot("11:30", "13:00")) })],
+      ["15-minute step", week({ fri: openDay(slot("09:15", "12:00")) })],
+      ["end before start", week({ sat: openDay(slot("12:00", "09:00")) })],
+      ["bad time", week({ sun: openDay(slot("24:00", "25:00")) })],
+      ["too many slots", week({ mon: openDay(...Array.from({ length: 13 }, (_, i) => slot(`${String(6 + i).padStart(2, "0")}:00`, `${String(6 + i).padStart(2, "0")}:30`))) })],
+      ["non-boolean closed", week({ mon: { closed: "no", slots: [slot("09:00", "10:00")] } })],
+      ["array", KEYS.map(() => CLOSED)],
+      ["string", "always open"],
+    ]) {
+      const res = await putWeekly(W.wes, days);
+      assert.equal(res.status, 422, `${label}: ${JSON.stringify(res.json)}`);
+    }
+    assert.equal((await call(W.wes, "PUT", `/api/studios/${W.studioId}/weekly-hours`, { days: week(), studioId: "x" })).status, 422, "unknown top-level field");
+    assert.equal(await stored(), null, "nothing was written");
+  });
+
+  test("weekly hours are stored (sorted) and drive the public day and month views", async () => {
+    const days = week({
+      mon: openDay(slot("13:00", "16:00"), slot("10:00", "12:00")),
+      sat: CLOSED,
+      tue: openDay(slot("18:00", "22:00")),
+    });
+    const res = await putWeekly(W.wes, days);
+    assert.equal(res.status, 200, JSON.stringify(res.json));
+    const saved = await stored();
+    assert.deepEqual(saved.mon.slots, [slot("10:00", "12:00"), slot("13:00", "16:00")], "slots stored sorted");
+    assert.deepEqual(saved.sat, CLOSED);
+
+    const mon = nth("mon", 0), sat = nth("sat", 0);
+    assert.deepEqual((await dayView(mon)).json, { date: mon, isClosed: false, open: [slot("10:00", "12:00"), slot("13:00", "16:00")], source: "weekly" });
+    assert.deepEqual((await dayView(sat)).json, { date: sat, isClosed: true, open: [], source: "weekly" });
+
+    const m = (await monthView(mon)).json;
+    assert.deepEqual(m.days[mon], ["10:00", "10:30", "11:00", "13:00", "13:30", "14:00", "14:30", "15:00"], "60-min package inside weekly windows");
+    for (const d of Object.keys(m.days)) assert.notEqual(weekdayOf(d), "sat", `closed weekday ${d} is not offered`);
+    const wedTimes = Object.entries(m.days).find(([d]) => weekdayOf(d) === "wed")?.[1];
+    if (wedTimes) assert.deepEqual([wedTimes[0], wedTimes.at(-1)], ["09:00", "16:00"]);
+  });
+
+  test("bookings are only accepted inside weekly hours", async () => {
+    const mon = nth("mon", 0);
+    assert.equal((await book(W.kim, mon, "12:00")).json.error.code, "OUTSIDE_HOURS", "the gap between slots");
+    assert.equal((await book(W.kim, mon, "09:00")).status, 409);
+    assert.equal((await book(W.kim, mon, "15:30")).status, 409, "would run past 16:00");
+    assert.equal((await book(W.kim, nth("sat", 0), "10:00")).json.error.code, "DAY_CLOSED");
+    const ok = await book(W.kim, mon, "10:00");
+    assert.equal(ok.status, 201, JSON.stringify(ok.json));
+    W.monBooking = ok.json.bookingId;
+    W.mon = mon;
+    const tue = nth("tue", 0);
+    const late = await book(W.lee, tue, "20:00");
+    assert.equal(late.status, 201, "Tuesday 18:00–22:00 is outside the default hours but inside weekly hours");
+    W.tueBooking = late.json.bookingId;
+    W.tue = tue;
+  });
+
+  test("a date-specific schedule overrides weekly hours; resetting it falls back to weekly hours", async () => {
+    const sat = nth("sat", 1), mon = nth("mon", 1);
+    assert.equal((await av(W.wes, sat, { isClosed: false, slots: [slot("08:00", "11:00")] })).status, 200);
+    assert.deepEqual((await dayView(sat)).json.source, "studio");
+    assert.equal((await book(W.lee, sat, "08:00")).status, 201, "closed weekday opened for one date");
+    assert.equal((await av(W.wes, mon, { isClosed: true, slots: [] })).status, 200);
+    assert.equal((await book(W.lee, mon, "10:00")).json.error.code, "DAY_CLOSED", "open weekday closed for one date");
+
+    // Reset the Saturday: weekly hours say closed, but the 08:00 booking must keep its time.
+    const refused = await av(W.wes, sat, undefined, "DELETE");
+    assert.equal(refused.status, 409, JSON.stringify(refused.json));
+    assert.equal(refused.json.error.code, "BOOKED_TIME");
+    assert.equal((await dayDoc(sat)).slots.length, 1, "day schedule kept");
+    // The Monday has no bookings: reset → weekly Monday hours again.
+    assert.equal((await av(W.wes, mon, undefined, "DELETE")).status, 200);
+    assert.equal((await dayView(mon)).json.source, "weekly");
+    assert.deepEqual((await dayView(mon)).json.open, [slot("10:00", "12:00"), slot("13:00", "16:00")]);
+  });
+
+  test("weekly changes can never strand an upcoming pending or confirmed booking", async () => {
+    const before = await stored();
+    // Pending Monday 10:00 (Kim) blocks closing Mondays or dropping 10:00–11:00.
+    for (const days of [week({ ...before, mon: CLOSED }), week({ ...before, mon: openDay(slot("13:00", "16:00")) }), week({ ...before, mon: openDay(slot("10:30", "12:00")) })]) {
+      const res = await putWeekly(W.wes, days);
+      assert.equal(res.status, 409, JSON.stringify(res.json));
+      assert.equal(res.json.error.code, "BOOKED_TIME");
+      assert.match(res.json.error.message, new RegExp(`${W.mon} 10:00`));
+    }
+    // Confirmed bookings are protected too.
+    assert.equal((await act(W.wes, W.monBooking, "confirm")).status, 200);
+    assert.equal((await putWeekly(W.wes, week({ ...before, mon: CLOSED }))).status, 409);
+    // Resetting to the default 07:00–20:00 would strand the Tuesday 20:00 booking.
+    const reset = await delWeekly(W.wes);
+    assert.equal(reset.status, 409);
+    assert.match(JSON.stringify(reset.json), new RegExp(`${W.tue} 20:00`));
+    assert.deepEqual(await stored(), before, "weekly hours unchanged after refusals");
+
+    // Hours that still contain every booking are fine.
+    const narrowed = week({ ...before, mon: openDay(slot("10:00", "11:00")), tue: openDay(slot("20:00", "21:00")), sat: CLOSED });
+    assert.equal((await putWeekly(W.wes, narrowed)).status, 200);
+    // The Saturday booking has its own day schedule, so closing Saturdays doesn't touch it.
+    assert.deepEqual((await stored()).mon, openDay(slot("10:00", "11:00")));
+  });
+
+  test("cancelled, declined and expired bookings don't block weekly changes", async () => {
+    // Studio declines Tuesday 20:00 → default hours are allowed again.
+    assert.equal((await act(W.wes, W.tueBooking, "decline")).status, 200);
+    // An expired pending request (today 00:00, never answered) on today's weekday.
+    const today = nepalToday();
+    const ref = db.collection("bookings").doc();
+    await ref.set({
+      customerId: W.lee.uid, studioId: W.studioId, studioOwnerId: W.wes.uid, packageId: W.pkg, photographyCategory: "newborn",
+      shootDate: today, startTime: "00:00", endTime: "01:00", timezone: "Asia/Kathmandu", customerName: "Expired", customerPhone: "+9779811111177",
+      customerNote: null, packageSnapshot: { name: "Mini Session", price: 1000000, durationMinutes: 60 },
+      studioSnapshot: { businessName: "Weekly Hours Studio", slug: "weekly" }, paymentStatus: "unpaid", payoutStatus: "not_due", currency: "NPR",
+      grossAmount: 1000000, commissionRateBps: 800, commissionAmount: 80000, photographerNetAmount: 920000, bookingStatus: "pending",
+      confirmedAt: null, completedAt: null, cancelledAt: null, reviewedAt: null, createdAt: new Date(), updatedAt: new Date(),
+    });
+    const current = await stored();
+    const closeToday = { ...current, [weekdayOf(today)]: weekdayOf(today) === "mon" ? current.mon : CLOSED };
+    assert.equal((await putWeekly(W.wes, closeToday)).status, 200, "the expired request has no hours to protect");
+    assert.equal((await delWeekly(W.wes)).status, 200, "default hours contain every remaining booking");
+    assert.equal(await stored(), null);
+    assert.equal((await dayView(nth("wed", 0))).json.source, "default");
+    assert.equal((await delWeekly(W.wes)).status, 200, "clearing twice is harmless");
+  });
+
+  test("race: closing a weekday vs a booking on that weekday — exactly one wins, never a stranded booking", async () => {
+    const base = week({ wed: openDay(slot("09:00", "17:00")) });
+    assert.equal((await putWeekly(W.wes, base)).status, 200);
+    for (let i = 0; i < 4; i++) {
+      const wed = nth("wed", 2 + i);
+      const [weekly, booking] = await Promise.all([putWeekly(W.wes, week({ wed: CLOSED })), book(i % 2 ? W.kim : W.lee, wed, "10:00")]);
+      const wins = [weekly.status === 200, booking.status === 201];
+      assert.ok(wins.filter(Boolean).length === 1, `round ${i}: weekly ${weekly.status} ${JSON.stringify(weekly.json)}, booking ${booking.status} ${JSON.stringify(booking.json)}`);
+      if (booking.status === 201) {
+        assert.equal(weekly.json.error.code, "BOOKED_TIME");
+        assert.equal((await stored()).wed.closed, false);
+        assert.equal((await act(W.wes, booking.json.bookingId, "decline")).status, 200);
+      } else {
+        assert.equal(booking.json.error.code, "DAY_CLOSED");
+        assert.equal((await stored()).wed.closed, true);
+      }
+      assert.equal((await putWeekly(W.wes, base)).status, 200, "reopen for the next round");
+    }
+  });
+
+  test("bulk: validation and editable-range checks refuse the whole request", async () => {
+    const hours = { isClosed: true, slots: [] };
+    const d = (n) => plusDays(40 + n);
+    for (const [label, body] of [
+      ["no dates", { dates: [], hours }],
+      ["32 dates", { dates: Array.from({ length: 32 }, (_, i) => plusDays(10 + i)), hours }],
+      ["duplicate", { dates: [d(0), d(0)], hours }],
+      ["bad format", { dates: ["2026-1-5"], hours }],
+      ["impossible date", { dates: ["2027-02-30"], hours }],
+      ["today", { dates: [nepalToday(), d(1)], hours }],
+      ["too far ahead", { dates: [plusDays(400)], hours }],
+      ["hours and reset", { dates: [d(0)], hours, reset: true }],
+      ["neither", { dates: [d(0)] }],
+      ["reset false", { dates: [d(0)], reset: false }],
+      ["invalid hours", { dates: [d(0)], hours: { isClosed: false, slots: [slot("10:00", "09:00")] } }],
+      ["closed with slots", { dates: [d(0)], hours: { isClosed: true, slots: [slot("10:00", "11:00")] } }],
+      ["extra field", { dates: [d(0)], hours, studioId: S.studioA }],
+    ]) {
+      const res = await bulk(W.wes, body);
+      assert.equal(res.status, 422, `${label}: ${res.status} ${JSON.stringify(res.json)}`);
+    }
+    for (const n of [0, 1]) assert.equal(await dayDoc(d(n)), undefined, "nothing written");
+  });
+
+  test("bulk: applies hours to every date, each in its own transaction, reporting conflicts per date", async () => {
+    const free = [plusDays(50), plusDays(51), plusDays(52)];
+    const all = await bulk(W.wes, { dates: [...free].reverse(), hours: { isClosed: false, slots: [slot("14:00", "16:00")] } });
+    assert.equal(all.status, 200, JSON.stringify(all.json));
+    assert.deepEqual(all.json, { ok: true, saved: 3, results: free.map((date) => ({ date, ok: true, mode: "custom" })) });
+    for (const date of free) assert.deepEqual((await dayDoc(date)).slots.map((s) => [s.start, s.end]), [["14:00", "16:00"]]);
+
+    // The confirmed Monday 10:00 booking blocks only its own date.
+    const mixed = [plusDays(53), W.mon, plusDays(54)];
+    const res = await bulk(W.wes, { dates: mixed, hours: { isClosed: true, slots: [] } });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.ok, false);
+    assert.equal(res.json.saved, 2);
+    const failed = res.json.results.filter((r) => !r.ok);
+    assert.deepEqual(failed.map((r) => [r.date, r.code]), [[W.mon, "BOOKED_TIME"]]);
+    assert.ok(failed[0].message.length > 10);
+    assert.equal(await dayDoc(W.mon), undefined, "booked date unchanged");
+    assert.equal((await dayDoc(plusDays(53))).isClosed, true);
+    assert.equal((await dayDoc(plusDays(54))).isClosed, true);
+    assert.equal((await db.doc(`bookings/${W.monBooking}`).get()).get("bookingStatus"), "confirmed");
+
+    // Reset → back to weekly/default hours; dates without a schedule are fine too.
+    const reset = await bulk(W.wes, { dates: [...free, plusDays(53), plusDays(55)], reset: true });
+    assert.equal(reset.status, 200);
+    assert.equal(reset.json.saved, 5);
+    assert.ok(reset.json.results.every((r) => r.ok && r.mode === "standard"));
+    for (const date of [...free, plusDays(53)]) assert.equal(await dayDoc(date), undefined);
+    assert.equal((await dayView(plusDays(50))).json.source, "weekly");
+  });
+
+  test("bulk: 31 dates in one request", async () => {
+    const dates = Array.from({ length: 31 }, (_, i) => plusDays(100 + i));
+    const res = await bulk(W.wes, { dates, hours: { isClosed: false, slots: [slot("09:00", "12:00"), slot("13:00", "15:00")] } });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.saved, 31);
+    assert.deepEqual(res.json.results.map((r) => r.date), dates);
+    assert.equal((await bulk(W.wes, { dates, reset: true })).json.saved, 31);
+    assert.equal((await db.collection(`studios/${W.studioId}/availability`).where("date", ">=", dates[0]).get()).size, 0);
+  });
+
+  test("public views stay booking-free with weekly hours; dashboard pages render for the owner only", async () => {
+    const contact = (await db.doc(`studios/${W.studioId}/private/contact`).get()).data();
+    const needles = [W.monBooking, W.kim.uid, W.wes.uid, "Weekly Customer", "9811111177", contact.phone, contact.email, contact.address, "pending", "confirmed", "busy", "commission"];
+    const d = await dayView(W.mon);
+    assert.deepEqual(Object.keys(d.json).sort(), ["date", "isClosed", "open", "source"]);
+    const m = await monthView(W.mon);
+    for (const body of [JSON.stringify(d.json), JSON.stringify(m.json)]) for (const n of needles) assert.ok(!body.includes(n), `leaks ${n}`);
+    assert.ok(!(m.json.days[W.mon] ?? []).includes("10:00"), "booked time not offered");
+
+    const weeklyPage = await page("/dashboard/availability/weekly", W.wes);
+    assert.equal(weeklyPage.status, 200);
+    assert.match(weeklyPage.html, /Save weekly hours/);
+    assert.match(weeklyPage.html, /Wednesday slot 1 start/);
+    const cal = await page(`/dashboard/availability?month=${W.mon.slice(0, 7)}&date=${W.mon}`, W.wes);
+    assert.equal(cal.status, 200);
+    assert.match(cal.html, /data-weekly-summary/);
+    assert.match(cal.html, /Apply to more days/);
+    assert.equal((await page("/dashboard/availability/weekly", W.kim)).status, 307, "customer redirected");
+    assert.equal((await page("/dashboard/availability/weekly", null)).status, 307, "signed out redirected");
   });
 });
 

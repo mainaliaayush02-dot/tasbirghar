@@ -18,12 +18,13 @@ export const LEGEND = [
   { label: "Confirmed booking", swatch: "bg-emerald-600" },
   { label: "Completed booking", swatch: "bg-sky-600" },
   { label: "Unavailable", swatch: "bg-neutral-300" },
+  { label: "Closed (weekly hours)", swatch: "border border-dashed border-neutral-400 bg-neutral-100" },
 ];
 
 function dayLabel(day: CalendarDay) {
   if (day.mode === "closed") return "Unavailable";
   if (day.mode === "custom") return `${day.slots.length} slot${day.slots.length === 1 ? "" : "s"}`;
-  return "Standard";
+  return day.standard.closed ? "Closed" : "Standard";
 }
 
 /**
@@ -79,7 +80,9 @@ export function AvailabilityCalendar({
                     ? "border-brand-600 ring-2 ring-brand-200"
                     : day.mode === "closed"
                       ? "border-transparent bg-neutral-200/70 hover:border-neutral-300"
-                      : "border-neutral-200 bg-white hover:border-neutral-400"
+                      : day.mode === "standard" && day.standard.closed
+                        ? "border-dashed border-neutral-300 bg-neutral-100 hover:border-neutral-400"
+                        : "border-neutral-200 bg-white hover:border-neutral-400"
                 } ${isPast ? "opacity-50" : ""}`}
               >
                 <span className={`font-medium ${day.date === today ? "rounded-full bg-ink px-1.5 text-cream" : "text-neutral-900"}`}>

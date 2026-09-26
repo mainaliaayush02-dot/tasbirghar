@@ -1,6 +1,6 @@
 import { PHOTOGRAPHY_CATEGORIES, type CategorySlug } from "@/config/categories";
 import { LOCATIONS, type LocationSlug } from "@/config/locations";
-import { MAX_SLOTS_PER_DAY } from "@/lib/booking/rules";
+import { MAX_SLOTS_PER_DAY, WEEKDAY_KEYS, type WeeklyHours } from "@/lib/booking/rules";
 import { BOOKING_ACTIONS, type BookingAction } from "@/lib/booking/transitions";
 import { NOTIFICATION_ID_RE } from "@/lib/notifications/types";
 import { COMMENT_MAX, COMMENT_MIN, RATING_MAX, RATING_MIN } from "@/lib/reviews/rules";
@@ -22,6 +22,7 @@ import {
   text,
   textList,
   type Schema,
+  validate,
 } from "./core";
 
 export const CATEGORY_SLUGS = PHOTOGRAPHY_CATEGORIES.map((c) => c.slug) as CategorySlug[];
@@ -416,4 +417,70 @@ export const notificationReadSchema: Schema<NotificationReadInput> = {
     return { ok: true, value: value as string[] };
   },
   all: (value) => (value === undefined ? { ok: true, value: null } : value === true ? { ok: true, value: true } : { ok: false, error: "Must be true." }),
+};
+
+/* ---------------------------------------------------- weekly hours (4B-4) */
+
+export interface WeeklyHoursInput {
+  days: WeeklyHours;
+}
+
+/**
+ * PUT /api/studios/{id}/weekly-hours { days: { sun: { closed, slots }, … sat } }
+ * All seven weekdays are required; each has exactly `closed` and `slots`.
+ * Semantic checks (steps, overlaps, closed-without-slots) run in
+ * weeklyHoursError on the server.
+ */
+export const weeklyHoursSchema: Schema<WeeklyHoursInput> = {
+  days: (value) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return { ok: false, error: "Required." };
+    const keys = Object.keys(value);
+    if (keys.length !== WEEKDAY_KEYS.length || !WEEKDAY_KEYS.every((k) => keys.includes(k))) {
+      return { ok: false, error: "Send all seven weekdays (sun–sat) and nothing else." };
+    }
+    const out = {} as WeeklyHours;
+    for (const key of WEEKDAY_KEYS) {
+      const day = (value as Record<string, unknown>)[key];
+      if (typeof day !== "object" || day === null || Array.isArray(day)) return { ok: false, error: `${key}: invalid.` };
+      const dayKeys = Object.keys(day);
+      if (dayKeys.length !== 2 || !dayKeys.includes("closed") || !dayKeys.includes("slots")) return { ok: false, error: `${key}: send exactly closed and slots.` };
+      const { closed, slots } = day as Record<string, unknown>;
+      if (typeof closed !== "boolean") return { ok: false, error: `${key}: closed must be true or false.` };
+      const parsed = slotList(MAX_SLOTS_PER_DAY)(slots);
+      if (!parsed.ok) return { ok: false, error: `${key}: ${parsed.error}` };
+      out[key] = { closed, slots: parsed.value };
+    }
+    return { ok: true, value: out };
+  },
+};
+
+/* --------------------------------------------------- bulk availability (4B-4) */
+
+export const MAX_BULK_DATES = 31;
+
+export interface BulkAvailabilityInput {
+  dates: string[];
+  hours: AvailabilityDayInput | null;
+  reset: true | null;
+}
+
+/**
+ * PUT /api/studios/{id}/availability/bulk
+ *   { dates: [...], hours: { isClosed, slots } }  apply the same schedule
+ *   { dates: [...], reset: true }                  back to standard hours
+ * 1–31 unique dates; exactly one of `hours` / `reset` (checked by the route).
+ */
+export const bulkAvailabilitySchema: Schema<BulkAvailabilityInput> = {
+  dates: (value) => {
+    if (!Array.isArray(value) || value.length === 0 || value.length > MAX_BULK_DATES) return { ok: false, error: `Choose 1–${MAX_BULK_DATES} dates.` };
+    if (!value.every((d) => typeof d === "string" && /^\d{4}-\d{2}-\d{2}$/.test(d))) return { ok: false, error: "Dates must be YYYY-MM-DD." };
+    if (new Set(value).size !== value.length) return { ok: false, error: "Duplicate dates." };
+    return { ok: true, value: value as string[] };
+  },
+  hours: (value) => {
+    if (value === undefined) return { ok: true, value: null };
+    const result = validate(availabilityDaySchema, value);
+    return result.ok ? { ok: true, value: result.data } : { ok: false, error: Object.values(result.errors)[0] ?? "Invalid hours." };
+  },
+  reset: (value) => (value === undefined ? { ok: true, value: null } : value === true ? { ok: true, value: true } : { ok: false, error: "Must be true." }),
 };

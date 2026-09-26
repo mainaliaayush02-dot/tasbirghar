@@ -22,8 +22,7 @@ import {
   ACTIVE_BOOKING_STATUSES,
   BLOCKING_BOOKING_STATUSES,
   bookableRange,
-  DEFAULT_CLOSE,
-  DEFAULT_OPEN,
+  effectiveHours,
   freeStartTimes,
   fromMinutes,
   isRealDate,
@@ -33,7 +32,10 @@ import {
   monthDates,
   SLOT_STEP_MINUTES,
   slotsError,
+  strandedByWeekly,
   toMinutes,
+  weeklyHoursError,
+  type WeeklyHours,
   type Window,
 } from "./rules";
 import { queueBookingNotification } from "@/lib/notifications/service";
@@ -48,6 +50,10 @@ import { checkTransition, isExpiredPending, type BookingAction } from "./transit
  * - The client only states intent (studio, package, date, start time,
  *   contact). Price, commission, payout, owner, end time and status are
  *   derived here from Firestore — never from the request.
+ * - Open hours for a date come from `effectiveHours` (rules.ts): the date's own
+ *   schedule, else the studio's weekly hours (studios/{id}.weeklyHours), else
+ *   the default. Weekly hours live on the studio doc, which every booking
+ *   transaction reads, so a weekly change serializes with booking requests.
  * - Photographer availability docs may CLOSE a day or RESTRICT times, but the
  *   final authority is the set of existing blocking bookings (pending,
  *   confirmed, completed), checked inside a transaction.
@@ -86,18 +92,13 @@ export interface DayAvailability {
   isClosed: boolean;
   /** Windows the studio is open for bookings that day. */
   open: Window[];
-  /** "studio" when the studio published availability; else default hours. */
-  source: "studio" | "default";
+  /** "studio" = a date-specific schedule, "weekly" = the studio's weekly hours, "default" = default hours. */
+  source: "studio" | "weekly" | "default";
 }
 
-function openWindows(day: Pick<AvailabilityDayDoc, "isClosed" | "slots"> | undefined): { isClosed: boolean; open: Window[]; source: "studio" | "default" } {
-  if (!day) return { isClosed: false, open: [{ start: DEFAULT_OPEN, end: DEFAULT_CLOSE }], source: "default" };
-  if (day.isClosed) return { isClosed: true, open: [], source: "studio" };
-  const slots = (day.slots ?? []).filter((s) => s.status === "open").map((s) => ({ start: s.start, end: s.end }));
-  // A day doc without any slots means "open, default hours".
-  if (!day.slots?.length) return { isClosed: false, open: [{ start: DEFAULT_OPEN, end: DEFAULT_CLOSE }], source: "default" };
-  return { isClosed: false, open: slots, source: "studio" };
-}
+const weeklyOf = (studio: { get(field: string): unknown }) => (studio.get("weeklyHours") as WeeklyHours | null | undefined) ?? null;
+/** Public `source` values of the day view (kept stable for API clients). */
+const PUBLIC_SOURCE = { day: "studio", weekly: "weekly", default: "default" } as const;
 
 const windowsWith = (statuses: BookingStatus[]) => (docs: FirebaseFirestore.QueryDocumentSnapshot[], exceptId?: string): Window[] =>
   docs
@@ -114,8 +115,8 @@ export async function getDayAvailability(studioId: string, date: string): Promis
   if (!studio.exists || studio.get("listingStatus") !== "published") throw notFound("Studio");
   assertBookableDate(date);
   const day = await studioSub(studioId, "availability").doc(date).get();
-  const { isClosed, open, source } = openWindows(day.data() as AvailabilityDayDoc | undefined);
-  return { date, isClosed, open, source };
+  const { isClosed, open, source } = effectiveHours(day.data() as AvailabilityDayDoc | undefined, weeklyOf(studio), date);
+  return { date, isClosed, open, source: PUBLIC_SOURCE[source] };
 }
 
 function assertBookableDate(date: string) {
@@ -180,7 +181,8 @@ export async function createBooking(user: CurrentUser, input: BookingCreateInput
       throw new ApiError(429, "TOO_MANY_PENDING", `You can have up to ${MAX_PENDING_PER_CUSTOMER} open booking requests at a time.`);
     }
 
-    const { isClosed, open } = openWindows(daySnap.data() as AvailabilityDayDoc | undefined);
+    // Weekly hours from the studio doc read INSIDE this transaction.
+    const { isClosed, open } = effectiveHours(daySnap.data() as AvailabilityDayDoc | undefined, weeklyOf(freshStudio), input.shootDate);
     if (isClosed) throw new ApiError(409, "DAY_CLOSED", "The studio is not taking bookings on this date.");
     const fits = open.some((o) => toMinutes(o.start) <= toMinutes(window.start) && toMinutes(window.end) <= toMinutes(o.end));
     if (!fits) {
@@ -358,8 +360,9 @@ export async function getMonthAvailability(studioId: string, month: string, pack
   const [dayDocs, bookings] = await Promise.all([availabilityDocs(studioId, dates), bookingsOnDates(studioId, dates)]);
 
   const days: Record<string, string[]> = {};
+  const weekly = weeklyOf(studio);
   for (const date of dates) {
-    const { isClosed, open } = openWindows(dayDocs.get(date));
+    const { isClosed, open } = effectiveHours(dayDocs.get(date), weekly, date);
     if (isClosed) continue;
     const blocking = blockingWindows(bookings.filter((b) => b.get("shootDate") === date));
     const times = freeStartTimes(open, blocking, pkg.durationMinutes);
@@ -379,9 +382,12 @@ export interface CalendarBooking {
 
 export interface CalendarDay {
   date: string;
-  /** standard = default hours (no custom schedule), custom = own slots, closed = unavailable. */
+  /** standard = no date-specific schedule (weekly or default hours), custom = own slots, closed = unavailable. */
   mode: "standard" | "custom" | "closed";
+  /** The date's own slots (custom mode only). */
   slots: Window[];
+  /** What "standard hours" means on this date: the weekly hours for its weekday, or the default. */
+  standard: { closed: boolean; slots: Window[]; source: "weekly" | "default" };
   bookings: CalendarBooking[];
   /** Inside the editable window (tomorrow … +180 days). */
   editable: boolean;
@@ -390,15 +396,18 @@ export interface CalendarDay {
 /** Owner calendar for one month: schedule + that month's bookings. Caller must authorize. */
 export async function getStudioCalendar(studioId: string, month: string): Promise<CalendarDay[]> {
   const dates = monthDates(month);
-  const [dayDocs, bookings] = await Promise.all([availabilityDocs(studioId, dates), bookingsOnDates(studioId, dates)]);
+  const [dayDocs, bookings, studio] = await Promise.all([availabilityDocs(studioId, dates), bookingsOnDates(studioId, dates), studioRef(studioId).get()]);
+  const weekly = weeklyOf(studio);
   const { min, max } = bookableRange();
   return dates.map((date) => {
     const doc = dayDocs.get(date);
-    const { isClosed, open, source } = openWindows(doc);
+    const { isClosed, open, source } = effectiveHours(doc, weekly, date);
+    const std = effectiveHours(undefined, weekly, date);
     return {
       date,
-      mode: isClosed ? "closed" : source === "studio" ? "custom" : "standard",
-      slots: source === "studio" ? open : [],
+      mode: source === "day" ? (isClosed ? "closed" : "custom") : "standard",
+      slots: source === "day" ? open : [],
+      standard: { closed: std.isClosed, slots: std.open, source: std.source === "weekly" ? "weekly" : "default" },
       bookings: bookings
         .filter((b) => b.get("shootDate") === date)
         .map((b) => ({
@@ -432,17 +441,19 @@ function assertEditableDate(date: string) {
  * edit is refused if a pending/confirmed booking would fall outside the new
  * open hours. Caller must have verified ownership (assertStudioOwner).
  */
+function assertDayInput(input: AvailabilityDayInput) {
+  if (input.isClosed && input.slots.length) {
+    throw new ApiError(422, "VALIDATION_FAILED", "An unavailable day can't have time slots.", { slots: "Remove the time slots or keep the day available." });
+  }
+  if (!input.isClosed) {
+    const error = slotsError(input.slots);
+    if (error) throw new ApiError(422, "VALIDATION_FAILED", error, { slots: error });
+  }
+}
+
 export async function setDayAvailability(studioId: string, date: string, input: AvailabilityDayInput | null): Promise<CalendarDay["mode"]> {
   assertEditableDate(date);
-  if (input) {
-    if (input.isClosed && input.slots.length) {
-      throw new ApiError(422, "VALIDATION_FAILED", "An unavailable day can't have time slots.", { slots: "Remove the time slots or keep the day available." });
-    }
-    if (!input.isClosed) {
-      const error = slotsError(input.slots);
-      if (error) throw new ApiError(422, "VALIDATION_FAILED", error, { slots: error });
-    }
-  }
+  if (input) assertDayInput(input);
 
   const dayRef = studioSub(studioId, "availability").doc(date);
   const slots = input && !input.isClosed ? [...input.slots].sort((a, b) => toMinutes(a.start) - toMinutes(b.start)) : [];
@@ -451,8 +462,14 @@ export async function setDayAvailability(studioId: string, date: string, input: 
     : undefined;
 
   await db().runTransaction(async (tx) => {
-    const [, existing, current] = await Promise.all([tx.get(lockRef(studioId, date)), tx.get(bookingsFor(studioId, date)), tx.get(dayRef)]);
-    const { isClosed, open } = openWindows(next);
+    const [, existing, current, studio] = await Promise.all([
+      tx.get(lockRef(studioId, date)),
+      tx.get(bookingsFor(studioId, date)),
+      tx.get(dayRef),
+      tx.get(studioRef(studioId)),
+    ]);
+    // Resetting to standard hours means the weekly hours (read in this transaction).
+    const { isClosed, open } = effectiveHours(next, weeklyOf(studio), date);
     const stranded = activeWindows(existing.docs).filter(
       (w) => isClosed || !open.some((o) => toMinutes(o.start) <= toMinutes(w.start) && toMinutes(w.end) <= toMinutes(o.end)),
     );
@@ -477,4 +494,99 @@ export async function setDayAvailability(studioId: string, date: string, input: 
   });
 
   return !next ? "standard" : next.isClosed ? "closed" : "custom";
+}
+
+/* ============================================================ weekly hours */
+
+const activeOfStudio = (studioId: string) =>
+  db().collection(collections.bookings).where("studioId", "==", studioId).where("bookingStatus", "in", ACTIVE_BOOKING_STATUSES);
+
+/**
+ * Owner sets (weekly) or resets (null → default hours) the studio's weekly
+ * hours. One transaction reads the studio doc, every open booking of the
+ * studio and those dates' day schedules, and refuses (409 BOOKED_TIME) if an
+ * upcoming pending/confirmed booking without its own day schedule would fall
+ * outside the new hours. Booking requests read the studio doc inside their
+ * own transaction, so the two can never interleave. Caller must have
+ * verified ownership (assertStudioOwner).
+ */
+export async function setWeeklyHours(studioId: string, weekly: WeeklyHours | null): Promise<void> {
+  if (weekly) {
+    const error = weeklyHoursError(weekly);
+    if (error) throw new ApiError(422, "VALIDATION_FAILED", error, { days: error });
+  }
+  const sRef = studioRef(studioId);
+  const sorted = weekly
+    ? (Object.fromEntries(
+        Object.entries(weekly).map(([k, d]) => [k, { closed: d.closed, slots: [...d.slots].sort((a, b) => toMinutes(a.start) - toMinutes(b.start)) }]),
+      ) as WeeklyHours)
+    : null;
+
+  await db().runTransaction(async (tx) => {
+    const [studio, active] = await Promise.all([tx.get(sRef), tx.get(activeOfStudio(studioId))]);
+    if (!studio.exists) throw notFound("Studio");
+    const now = nepalNowKey();
+    // Upcoming open bookings only (an expired request or past session has no hours to protect).
+    const upcoming = active.docs
+      .map((d) => d.data() as BookingDoc)
+      .filter((b) => `${b.shootDate}T${b.startTime}` > now)
+      .map((b) => ({ date: b.shootDate, start: b.startTime, end: b.endTime }));
+    const dates = [...new Set(upcoming.map((b) => b.date))];
+    const daySnaps = dates.length ? await tx.getAll(...dates.map((d) => studioSub(studioId, "availability").doc(d))) : [];
+    const dayDocs = new Map(daySnaps.map((d) => [d.id, d.data() as AvailabilityDayDoc | undefined]));
+    const stranded = strandedByWeekly(upcoming, dayDocs, sorted);
+    if (stranded.length) {
+      const list = stranded
+        .sort((a, b) => `${a.date}${a.start}`.localeCompare(`${b.date}${b.start}`))
+        .slice(0, 5)
+        .map((b) => `${b.date} ${b.start}–${b.end}`)
+        .join(", ");
+      throw new ApiError(
+        409,
+        "BOOKED_TIME",
+        `These hours would leave ${stranded.length} booking${stranded.length === 1 ? "" : "s"} outside your opening hours (${list}${stranded.length > 5 ? ", …" : ""}). Keep those times open, or decline/cancel the bookings first.`,
+      );
+    }
+    tx.update(sRef, { weeklyHours: sorted, updatedAt: FieldValue.serverTimestamp() });
+  });
+}
+
+/* ============================================================ bulk editing */
+
+export interface BulkDayResult {
+  date: string;
+  ok: boolean;
+  mode?: CalendarDay["mode"];
+  code?: string;
+  message?: string;
+}
+
+/**
+ * Applies the same day schedule (input) or a reset (null) to several dates.
+ * Each date runs through setDayAvailability — its own transaction under that
+ * studio-day's lock, with the same validation and stranding protection — so a
+ * conflict on one date never affects the others. Returns a result per date.
+ */
+export async function setDaysAvailability(studioId: string, dates: string[], input: AvailabilityDayInput | null): Promise<BulkDayResult[]> {
+  // The hours are the same for every date: invalid input refuses the whole request.
+  if (input) assertDayInput(input);
+  const results: BulkDayResult[] = [];
+  const queue = [...dates].sort();
+  const worker = async () => {
+    for (let date = queue.shift(); date; date = queue.shift()) {
+      try {
+        results.push({ date, ok: true, mode: await setDayAvailability(studioId, date, input) });
+      } catch (error) {
+        if (!(error instanceof ApiError)) throw error;
+        results.push({ date, ok: false, code: error.code, message: error.message });
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, queue.length) }, worker));
+  return results.sort((a, b) => a.date.localeCompare(b.date));
+}
+
+/** The studio's weekly hours (null = default hours). Caller must authorize. */
+export async function getWeeklyHours(studioId: string): Promise<WeeklyHours | null> {
+  return weeklyOf(await studioRef(studioId).get());
 }

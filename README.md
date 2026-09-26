@@ -45,7 +45,7 @@ With the Cloudinary variables set, run `npm run dev` and open <http://localhost:
 | `npm run lint` | ESLint |
 | `npm run test:rules` | Firestore security rules tests (needs the Firestore emulator on 127.0.0.1:8080) |
 | `npm run test:api` | API acceptance and security tests: auth, studios, media, marketplace, bookings and availability (needs the emulators and an emulator-wired app; see below) |
-| `npm run test:unit` | Pure booking, review and notification logic: transition table, expiry, slot validation, review eligibility, rating accounting, notification types/ids/rendering (no emulator needed) |
+| `npm run test:unit` | Pure booking, review, notification and weekly-hours logic: transition table, expiry, slot validation, review eligibility, rating accounting, notification types/ids/rendering, hours precedence and stranded-booking checks (no emulator needed) |
 | `npm run ratings:recompute` | Compare each studio's rating totals with its published reviews. Read-only by default; add `-- --apply` to fix differences |
 | `npm run admin:grant -- --email <email> --yes` | Grant the admin role to an existing user (add `--revoke` to remove it) |
 

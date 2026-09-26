@@ -274,6 +274,8 @@ To remove admin, run `npm run admin:grant -- --email you@example.com --revoke --
 | `PATCH/DELETE /api/studios/{id}/{portfolio\|gallery}/{itemId}` | owner | caption, category, order, featured, or delete (deletes the asset too) |
 | `POST /api/studios/{id}/packages`, `PUT/DELETE …/packages/{packageId}` | owner | packages (rupees in, integer paisa stored); keeps `startingPrice` in sync |
 | `PUT/DELETE /api/studios/{id}/availability/{date}` | owner | set a day's custom slots or mark it unavailable / reset it to standard hours (Phase 4A) |
+| `PUT/DELETE /api/studios/{id}/weekly-hours` | owner | set the studio's standard weekly hours / clear them back to the default (Phase 4B-4) |
+| `PUT /api/studios/{id}/availability/bulk` | owner | apply one day schedule, or a reset, to up to 31 dates (Phase 4B-4) |
 | `GET /api/studios/{id}/availability?month=&packageId=` / `?date=` | anyone (published studios) | bookable dates and free start times / one day's published open hours (never booking-derived) |
 | `POST /api/bookings`, `POST /api/bookings/{id}` | customer / customer or owner | request a booking; status transitions |
 
@@ -309,7 +311,7 @@ The owner is an ordinary Firebase Auth account that has been given the `admin` c
 | `(public)` | `/` (later `/photographers`, `/categories/[category]`, `/locations/[location]`, `/search`) |
 | `(auth)` | `/login`, `/signup` (noindex) |
 | `(customer)` | `/account`, `/become-a-photographer` |
-| `(studio)` | `/dashboard`, `/dashboard/studio`, `/portfolio`, `/gallery`, `/packages`, `/bookings`, `/availability`, `/verification` |
+| `(studio)` | `/dashboard`, `/dashboard/studio`, `/portfolio`, `/gallery`, `/packages`, `/bookings`, `/availability`, `/availability/weekly`, `/verification` |
 | `(admin)` | `/admin`, `/admin/applications[/uid]`, `/admin/studios[/id]`, `/admin/photographers`, `/admin/customers`, `/admin/bookings`, `/admin/reviews`, `/admin/commission`, `/admin/settings` |
 
 ---
@@ -388,7 +390,7 @@ The core loop: the studio sets availability → the customer sees only free date
 
 | Day state | Stored as | Customers can book |
 | --- | --- | --- |
-| Standard hours | no document | 7:00 AM – 8:00 PM (`DEFAULT_OPEN`–`DEFAULT_CLOSE`) |
+| Standard hours | no document | the studio's weekly hours for that weekday (section 6d), or 7:00 AM – 8:00 PM (`DEFAULT_OPEN`–`DEFAULT_CLOSE`) if none are set |
 | Custom time slots | `isClosed: false`, `slots: [{ start, end, status: "open", bookingId: null }]` | only inside one of the slots |
 | Unavailable | `isClosed: true`, `slots: []` | nothing |
 
@@ -543,6 +545,35 @@ Both routes are scoped to `users/{sessionUid}/notifications`, so one user's ids 
 
 **Limits.** No email, SMS or push. Old notifications aren't pruned (bounded by one per booking event). The page shows the latest 30.
 
+## 6d. Weekly hours and bulk availability (Phase 4B-4)
+
+**Model.** `studios/{id}.weeklyHours`: `{ sun … sat: { closed, slots: [{ start, end }] } }`, or absent/null for the default 7:00 AM – 8:00 PM every day. It lives on the public studio document because opening hours are public marketplace information. It is **server-written only**: the owner's client update allowlist doesn't include it, so rules needed no change (tests cover owner, other photographers, customers, admins and anonymous users).
+
+**Which hours apply** (`effectiveHours(day, weekly, date)` in `rules.ts`, used by the booking transaction, both public availability views and the owner calendar):
+1. a date-specific schedule (`availability/{date}`: unavailable, or its own slots);
+2. otherwise the weekly hours for that weekday (`weekdayKey`: the date is already Nepal-local);
+3. otherwise the default hours.
+
+The public `?date=` view reports this as `source: "studio" | "weekly" | "default"`. It still returns only published hours, never anything derived from bookings.
+
+**Setting weekly hours.** `PUT /api/studios/{id}/weekly-hours { days }` (all seven weekdays, each exactly `{ closed, slots }`, unknown keys rejected) or `DELETE` (back to the default). Both require `requireApiUser("photographer")`, `assertStudioOwner` and a same-origin request. `weeklyHoursError` applies the same slot rules as a single day (30-minute steps, end after start, no overlaps, at most 12), and a closed weekday can't have slots. `setWeeklyHours` then runs one transaction that:
+- reads the studio doc and the studio's `pending`/`confirmed` bookings (`studioId ==` + `bookingStatus in`, which needs no composite index; verified read-only on live);
+- keeps only upcoming ones (expired requests and past sessions have no hours to protect);
+- reads those dates' day docs (`tx.getAll`), because a date with its own schedule doesn't depend on weekly hours;
+- refuses with 409 `BOOKED_TIME`, naming up to 5 bookings, if any would fall outside the new hours (`strandedByWeekly`);
+- otherwise writes `weeklyHours` with its slots sorted.
+
+**Concurrency.** The booking transaction reads the studio doc, and `setWeeklyHours` writes it, so Firestore serializes a weekly change against booking requests. An API test races closing a weekday against a booking on it, four times: exactly one wins each round, and a booking is never stranded. Resetting one date to standard hours (`setDayAvailability`, `DELETE …/availability/{date}`) also reads the studio doc in its transaction, so the stranding check uses the current weekly hours.
+
+**Bulk editing.** `PUT /api/studios/{id}/availability/bulk` takes `{ dates, hours: { isClosed, slots } }` or `{ dates, reset: true }` (exactly one of the two). There are 1–31 unique dates, and all must be real and editable (tomorrow … +180 days). Invalid hours or any non-editable date refuse the **whole** request with 422. Each date then goes through `setDayAvailability`, in its own transaction under that studio-day's `bookingLocks` document with the usual stranding check, using 4 concurrent workers. A conflict on one date doesn't affect the others. The response is `{ ok, saved, results: [{ date, ok, mode | code, message }] }`, sorted by date.
+
+**UI.**
+- `/dashboard/availability/weekly` has one row per weekday with an open/closed toggle and time slots. It includes "Copy {day}'s hours to every day", instant validation (Save is disabled while invalid), and "Use default hours" behind a confirmation dialog. A server refusal (for example `BOOKED_TIME`) is shown as-is.
+- `/dashboard/availability` shows a "Weekly hours" summary card. On the calendar, weekly-closed days are dashed and labelled "Closed", and the day panel names the weekly hours with a link to change them.
+- "Apply to more days" in the day panel picks dates of the month (or "All {weekday}s this month") and saves them in one bulk request. It reports "Saved N of M days" and names the dates it didn't change, which stay selected.
+
+**Not built:** holiday calendars, recurring exceptions (for example "every other Friday") and per-package hours.
+
 ---
 
 ## 7. Money and commission model
@@ -610,7 +641,7 @@ Local values go in `.env.local`, which is gitignored. Production and preview val
 
 ### Firestore rules: what clients may do
 
-`firestore.rules` is deny-by-default and is covered by `tests/firestore-rules.test.mjs` (139 emulator tests). Client updates use **field allowlists**, so any field not listed is immutable from the client SDK.
+`firestore.rules` is deny-by-default and is covered by `tests/firestore-rules.test.mjs` (142 emulator tests). Client updates use **field allowlists**, so any field not listed is immutable from the client SDK.
 
 | Actor | Allowed | Everything else |
 | --- | --- | --- |
@@ -618,7 +649,7 @@ Local values go in `.env.local`, which is gitignored. Production and preview val
 | Signed-in user (customer) | Create own `users/{uid}` with `role: "customer"`, `studioId: null`, `photo: null`. Read own user doc and own `users/{uid}/notifications` (read-only). Update own `displayName`, `phone`, `updatedAt`. Read own bookings and own review documents. | Denied, including other customers' reviews (published or not) |
 | Photographer (owner: `users/{uid}.studioId` equals the studio id) | `get` own `private/contact` (not `private/internal`). Update own studio: `businessName`, `description`, `location` (keys `city`, `area`, `geo` only), `categories`, `facilities`, `props`, `updatedAt`. Portfolio: update `caption`, `category`, `sortOrder`, `isFeatured`, or delete. Gallery: update `caption`, `sortOrder`, or delete. Packages: create with `images: []`, NPR and an integer price; update details and price; delete. Read own availability (writes go through the owner API since Phase 4A). Read bookings where `studioOwnerId` is the photographer's uid. | Denied, including every other studio |
 | Admin (claim) | **Read** users, studios (including drafts) and their subcollections, `private/contact` and `private/internal` (single `get`), bookings and reviews. | **All client writes denied.** Admin mutations (moderation, commission, role grants) go through server routes using the Admin SDK. |
-| Server (Admin SDK) | Everything, since it bypasses rules: studio creation and slug reservation, `private/contact` and `private/internal`, availability, statuses, commission, stats, `startingPrice`, all `MediaAsset` fields, portfolio and gallery creation, package images, role claims and mirror, bookings, reviews. | n/a |
+| Server (Admin SDK) | Everything, since it bypasses rules: studio creation and slug reservation, `private/contact` and `private/internal`, availability and weekly hours, statuses, commission, stats, `startingPrice`, all `MediaAsset` fields, portfolio and gallery creation, package images, role claims and mirror, bookings, reviews. | n/a |
 
 Run the tests with a Firestore emulator running (`npx firebase-tools emulators:start --only firestore --project tasbirghar-f285b`), then `npm run test:rules`. Deploy with `npx firebase-tools deploy --only firestore:rules --project tasbirghar-f285b`, and only after the tests pass.
 

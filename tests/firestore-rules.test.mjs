@@ -1092,3 +1092,21 @@ describe("in-app notifications: owner read-only, server-written (Phase 4B-3)", (
     await assertSucceeds(getDoc(ref(customer("alice"), "users/alice")));
   });
 });
+
+describe("weekly hours are server-written (Phase 4B-4)", () => {
+  const WEEK = Object.fromEntries(["sun", "mon", "tue", "wed", "thu", "fri", "sat"].map((k) => [k, { closed: false, slots: [{ start: "09:00", end: "17:00" }] }]));
+  test("the owner cannot set, change or clear weeklyHours directly", async () => {
+    const db = photographer();
+    await assertFails(updateDoc(ref(db, "studios/studioA"), { weeklyHours: WEEK }));
+    await assertFails(updateDoc(ref(db, "studios/studioA"), { weeklyHours: null }));
+    await assertFails(updateDoc(ref(db, "studios/studioA"), { "weeklyHours.sat": { closed: true, slots: [] } }));
+    await assertFails(updateDoc(ref(db, "studios/studioA"), { businessName: "ok", weeklyHours: WEEK }));
+  });
+  test("other photographers, customers, admins and anonymous users cannot write weeklyHours", async () => {
+    for (const db of [photographer("pb"), customer("alice"), customerWithClaim("alice"), admin(), anon()]) {
+      await assertFails(updateDoc(ref(db, "studios/studioA"), { weeklyHours: WEEK }));
+    }
+  });
+  test("weekly hours on a published studio are public marketplace info", () =>
+    assertSucceeds(getDoc(ref(anon(), "studios/studioA"))));
+});

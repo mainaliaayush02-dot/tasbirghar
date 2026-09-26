@@ -7,50 +7,60 @@ import { useEffect, useRef, useState } from "react";
 import { BookingStatusPill } from "@/components/bookings/booking-status";
 import { Button } from "@/components/ui/button";
 import { Alert } from "@/components/ui/feedback";
-import { Select } from "@/components/ui/field";
 import { api } from "@/lib/client/api";
-import { DEFAULT_CLOSE, DEFAULT_OPEN, fromMinutes, MAX_SLOTS_PER_DAY, SLOT_STEP_MINUTES, slotsError, toMinutes, type Window } from "@/lib/booking/rules";
-import type { CalendarDay } from "@/lib/booking/service";
-import { formatDay, formatTime, formatTimeRange } from "@/lib/format";
+import { slotsError, toMinutes, WEEKDAY_LABELS, weekdayKey, type Window } from "@/lib/booking/rules";
+import type { BulkDayResult, CalendarDay } from "@/lib/booking/service";
+import { describeHours, formatDay, formatTimeRange } from "@/lib/format";
+
+import { nextSlot, SlotRows } from "./slot-rows";
 
 type Mode = CalendarDay["mode"];
 
-const TIMES = Array.from({ length: (24 * 60) / SLOT_STEP_MINUTES }, (_, i) => fromMinutes(i * SLOT_STEP_MINUTES));
-
-/** Suggest the next free hour after the last slot. */
-function nextSlot(slots: Window[]): Window {
-  const last = slots.length ? Math.max(...slots.map((s) => toMinutes(s.end))) : 10 * 60;
-  const start = Math.min(last, 22 * 60);
-  return { start: fromMinutes(start), end: fromMinutes(Math.min(start + 60, 23 * 60 + 30)) };
-}
-
 /**
- * Edits one day of the studio's own schedule. Validation here is instant
- * feedback only — the server re-validates everything and refuses edits that
- * would leave a pending/confirmed booking outside the open hours.
+ * Edits one day of the studio's own schedule, optionally applying the same
+ * hours to more days of the month. Validation here is instant feedback only —
+ * the server re-validates everything and refuses edits that would leave a
+ * pending/confirmed booking outside the open hours.
  */
-export function DayEditor({ studioId, day, packageDurations }: { studioId: string; day: CalendarDay; packageDurations: number[] }) {
+export function DayEditor({
+  studioId,
+  day,
+  monthDays,
+  packageDurations,
+}: {
+  studioId: string;
+  day: CalendarDay;
+  /** The calendar month, for "apply to more days". */
+  monthDays: { date: string; editable: boolean }[];
+  packageDurations: number[];
+}) {
   const router = useRouter();
   const root = useRef<HTMLDivElement>(null);
   const [mode, setMode] = useState<Mode>(day.mode);
   const [slots, setSlots] = useState<Window[]>(day.mode === "custom" ? day.slots : []);
   const [saving, setSaving] = useState(false);
-  const [message, setMessage] = useState<{ tone: "success" | "danger"; text: string } | null>(null);
+  const [message, setMessage] = useState<{ tone: "success" | "danger" | "warning"; text: string } | null>(null);
   // What is saved on the server. Updated immediately on a successful save, so
   // "unsaved changes" stays correct while router.refresh() is still loading.
   const [saved, setSaved] = useState<{ mode: Mode; slots: Window[] }>({ mode: day.mode, slots: day.mode === "custom" ? day.slots : [] });
+  const [extra, setExtra] = useState<string[]>([]);
 
   const localError = mode === "custom" ? slotsError(slots) : null;
   const dirty = mode !== saved.mode || (mode === "custom" && JSON.stringify(slots) !== JSON.stringify(saved.slots));
   const longest = packageDurations.length ? Math.max(...packageDurations) : 0;
   const tooShort = mode === "custom" && longest > 0 && slots.length > 0 && slots.every((s) => toMinutes(s.end) - toMinutes(s.start) < Math.min(...packageDurations));
+  const standardText = `${describeHours(day.standard)}${day.standard.source === "weekly" ? " (weekly hours)" : ""}`;
+  const weekday = weekdayKey(day.date);
+  const others = monthDays.filter((d) => d.editable && d.date !== day.date);
 
-  const edit = (next: (prev: Window[]) => Window[]) => {
+  const edit = (next: Window[]) => {
     setSlots(next);
     setMessage(null);
   };
-  const update = (i: number, key: keyof Window, value: string) =>
-    edit((prev) => prev.map((s, j) => (j === i ? { ...s, [key]: value } : s)));
+  const toggleExtra = (date: string) => {
+    setExtra((prev) => (prev.includes(date) ? prev.filter((d) => d !== date) : [...prev, date]));
+    setMessage(null);
+  };
 
   // Below xl the editor sits under the calendar: bring the tapped day into view.
   useEffect(() => {
@@ -62,18 +72,39 @@ export function DayEditor({ studioId, day, packageDurations }: { studioId: strin
   async function save() {
     setSaving(true);
     setMessage(null);
-    const url = `/api/studios/${studioId}/availability/${day.date}`;
-    const result =
-      mode === "standard"
-        ? await api(url, { method: "DELETE" })
-        : await api(url, { method: "PUT", body: { isClosed: mode === "closed", slots: mode === "custom" ? slots : [] } });
+    const hours = { isClosed: mode === "closed", slots: mode === "custom" ? slots : [] };
+    if (extra.length === 0) {
+      const url = `/api/studios/${studioId}/availability/${day.date}`;
+      const result = mode === "standard" ? await api(url, { method: "DELETE" }) : await api(url, { method: "PUT", body: hours });
+      setSaving(false);
+      if (!result.ok) {
+        setMessage({ tone: "danger", text: result.message });
+        return;
+      }
+      setSaved({ mode, slots: mode === "custom" ? slots : [] });
+      setMessage({ tone: "success", text: "Availability saved." });
+      router.refresh();
+      return;
+    }
+    // Same hours for this day and the selected days (one locked transaction per date).
+    const dates = [day.date, ...extra];
+    const result = await api<{ saved: number; results: BulkDayResult[] }>(`/api/studios/${studioId}/availability/bulk`, {
+      method: "PUT",
+      body: mode === "standard" ? { dates, reset: true } : { dates, hours },
+    });
     setSaving(false);
     if (!result.ok) {
       setMessage({ tone: "danger", text: result.message });
       return;
     }
-    setSaved({ mode, slots: mode === "custom" ? slots : [] });
-    setMessage({ tone: "success", text: "Availability saved." });
+    const failed = result.data.results.filter((r) => !r.ok);
+    if (!failed.some((r) => r.date === day.date)) setSaved({ mode, slots: mode === "custom" ? slots : [] });
+    setExtra(failed.map((r) => r.date).filter((d) => d !== day.date));
+    setMessage(
+      failed.length
+        ? { tone: "warning", text: `Saved ${result.data.saved} of ${dates.length} days. Not changed — ${failed.map((r) => `${formatDay(r.date)}: ${r.message}`).join(" ")}` }
+        : { tone: "success", text: `Availability saved for ${dates.length} days.` },
+    );
     router.refresh();
   }
 
@@ -82,7 +113,7 @@ export function DayEditor({ studioId, day, packageDurations }: { studioId: strin
       <div>
         <h2 className="text-lg font-semibold text-neutral-900">{formatDay(day.date, "long")}</h2>
         <p className="mt-0.5 text-sm text-neutral-500">
-          {day.mode === "closed" ? "Unavailable" : day.mode === "custom" ? "Custom time slots" : `Standard hours · ${formatTimeRange(DEFAULT_OPEN, DEFAULT_CLOSE)}`}
+          {day.mode === "closed" ? "Unavailable" : day.mode === "custom" ? "Custom time slots" : `Standard hours · ${standardText}`}
         </p>
       </div>
 
@@ -122,7 +153,7 @@ export function DayEditor({ studioId, day, packageDurations }: { studioId: strin
           <div role="radiogroup" aria-labelledby="day-hours" className="grid gap-2">
             {(
               [
-                ["standard", "Standard hours", `${formatTimeRange(DEFAULT_OPEN, DEFAULT_CLOSE)}`],
+                ["standard", "Standard hours", standardText],
                 ["custom", "Custom time slots", "Only the times you add can be booked"],
                 ["closed", "Unavailable", "No bookings on this day"],
               ] as const
@@ -152,46 +183,16 @@ export function DayEditor({ studioId, day, packageDurations }: { studioId: strin
               </label>
             ))}
           </div>
+          <p className="text-xs text-neutral-500">
+            <Link href="/dashboard/availability/weekly" className="font-medium text-brand-700 hover:underline">
+              Change your weekly hours
+            </Link>{" "}
+            to update standard hours for every {WEEKDAY_LABELS[weekday]}.
+          </p>
 
           {mode === "custom" && (
             <div className="space-y-3">
-              <ul className="space-y-2" aria-label="Time slots">
-                {slots.map((s, i) => (
-                  <li key={i} className="flex items-center gap-2" data-slot={i}>
-                    <Select aria-label={`Slot ${i + 1} start`} value={s.start} onChange={(e) => update(i, "start", e.target.value)} className="min-w-0 flex-1">
-                      {TIMES.map((t) => (
-                        <option key={t} value={t}>
-                          {formatTime(t)}
-                        </option>
-                      ))}
-                    </Select>
-                    <span className="text-neutral-400">–</span>
-                    <Select aria-label={`Slot ${i + 1} end`} value={s.end} onChange={(e) => update(i, "end", e.target.value)} className="min-w-0 flex-1">
-                      {TIMES.map((t) => (
-                        <option key={t} value={t}>
-                          {formatTime(t)}
-                        </option>
-                      ))}
-                    </Select>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      aria-label={`Delete slot ${formatTimeRange(s.start, s.end)}`}
-                      onClick={() => edit((prev) => prev.filter((_, j) => j !== i))}
-                    >
-                      Delete
-                    </Button>
-                  </li>
-                ))}
-              </ul>
-              <Button
-                variant="secondary"
-                size="sm"
-                disabled={slots.length >= MAX_SLOTS_PER_DAY}
-                onClick={() => edit((prev) => [...prev, nextSlot(prev)])}
-              >
-                + Add time slot
-              </Button>
+              <SlotRows slots={slots} onChange={edit} />
               {longest > 0 && (
                 <p className="text-xs text-neutral-500">
                   A session must fit inside one slot. Your packages last {Math.min(...packageDurations)}–{longest} minutes.
@@ -202,11 +203,72 @@ export function DayEditor({ studioId, day, packageDurations }: { studioId: strin
             </div>
           )}
 
+          {others.length > 0 && (
+            <details className="rounded-lg border border-neutral-200 bg-white px-3 py-2.5" open={extra.length > 0}>
+              <summary className="cursor-pointer text-sm font-medium text-neutral-900">
+                Apply to more days{extra.length > 0 ? ` · ${extra.length} selected` : ""}
+              </summary>
+              <div className="mt-3 space-y-3">
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => {
+                      setExtra(others.filter((d) => weekdayKey(d.date) === weekday).map((d) => d.date));
+                      setMessage(null);
+                    }}
+                  >
+                    All {WEEKDAY_LABELS[weekday]}s this month
+                  </Button>
+                  {extra.length > 0 && (
+                    <Button size="sm" variant="ghost" onClick={() => setExtra([])}>
+                      Clear
+                    </Button>
+                  )}
+                </div>
+                <div role="group" aria-label="Also apply to" className="grid grid-cols-7 gap-1">
+                  {Array.from({ length: new Date(`${monthDays[0].date}T00:00:00Z`).getUTCDay() }, (_, i) => (
+                    <span key={`lead-${i}`} aria-hidden />
+                  ))}
+                  {monthDays.map((d) => {
+                    const selectable = d.editable && d.date !== day.date;
+                    const on = extra.includes(d.date) || d.date === day.date;
+                    return (
+                      <button
+                        key={d.date}
+                        type="button"
+                        data-apply-date={d.date}
+                        disabled={!selectable}
+                        aria-pressed={on}
+                        aria-label={formatDay(d.date, "long")}
+                        onClick={() => toggleExtra(d.date)}
+                        className={`grid h-9 place-items-center rounded-md text-xs transition-colors ${
+                          d.date === day.date
+                            ? "bg-ink text-cream"
+                            : on
+                              ? "bg-brand-600 font-medium text-white"
+                              : selectable
+                                ? "bg-neutral-100 text-neutral-800 hover:bg-neutral-200"
+                                : "text-neutral-300"
+                        }`}
+                      >
+                        {Number(d.date.slice(8))}
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="text-xs text-neutral-500">
+                  The hours above are applied to each selected day. Days with a booking that wouldn&apos;t fit are left unchanged and listed.
+                </p>
+              </div>
+            </details>
+          )}
+
           {message && <Alert tone={message.tone}>{message.text}</Alert>}
 
-          <div className="flex items-center gap-3">
-            <Button onClick={save} loading={saving} disabled={!dirty || (mode === "custom" && !!localError)}>
-              Save availability
+          <div className="flex flex-wrap items-center gap-3">
+            <Button onClick={save} loading={saving} disabled={(!dirty && extra.length === 0) || (mode === "custom" && !!localError)}>
+              {extra.length > 0 ? `Save for ${extra.length + 1} days` : "Save availability"}
             </Button>
             {dirty && !saving && <span className="text-sm text-neutral-500">Unsaved changes</span>}
           </div>

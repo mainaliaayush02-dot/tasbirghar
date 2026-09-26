@@ -151,3 +151,90 @@ export function slotsError(slots: Window[]): string | null {
   }
   return null;
 }
+
+/* ------------------------------------------------------------ weekly hours */
+
+export const WEEKDAY_KEYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
+export type WeekdayKey = (typeof WEEKDAY_KEYS)[number];
+export const WEEKDAY_LABELS: Record<WeekdayKey, string> = {
+  sun: "Sunday", mon: "Monday", tue: "Tuesday", wed: "Wednesday", thu: "Thursday", fri: "Friday", sat: "Saturday",
+};
+
+/** One weekday's standard hours. A closed day has no slots. */
+export interface WeeklyDay {
+  closed: boolean;
+  slots: Window[];
+}
+/**
+ * A studio's standard weekly opening hours (studios/{id}.weeklyHours).
+ * Applies to every date without a date-specific schedule; null → the
+ * default DEFAULT_OPEN–DEFAULT_CLOSE every day.
+ */
+export type WeeklyHours = Record<WeekdayKey, WeeklyDay>;
+
+/** Weekday of a "YYYY-MM-DD" calendar date (the date is already Nepal-local). */
+export const weekdayKey = (date: string): WeekdayKey => WEEKDAY_KEYS[new Date(`${date}T00:00:00Z`).getUTCDay()];
+
+/** Validates a full weekly schedule. Returns an error message, or null. */
+export function weeklyHoursError(weekly: WeeklyHours): string | null {
+  for (const key of WEEKDAY_KEYS) {
+    const day = weekly[key];
+    if (!day) return `${WEEKDAY_LABELS[key]} is missing.`;
+    if (day.closed) {
+      if (day.slots.length) return `${WEEKDAY_LABELS[key]} is closed, so it can't have time slots.`;
+      continue;
+    }
+    const error = slotsError(day.slots);
+    if (error) return `${WEEKDAY_LABELS[key]}: ${error}`;
+  }
+  return null;
+}
+
+export type HoursSource = "day" | "weekly" | "default";
+
+/** Minimal shape of a stored day document (studios/{id}/availability/{date}). */
+export interface DayScheduleLike {
+  isClosed: boolean;
+  slots?: { start: string; end: string; status?: string }[];
+}
+
+/**
+ * The hours that apply to `date`, in order of precedence:
+ *   1. a date-specific schedule (closed, or its own open slots),
+ *   2. the studio's weekly hours for that weekday,
+ *   3. the default DEFAULT_OPEN–DEFAULT_CLOSE.
+ * A stored day document without slots (and not closed) means "standard hours".
+ * The booking transaction, availability views and the owner calendar all use
+ * this, so what is offered is exactly what can be booked.
+ */
+export function effectiveHours(
+  day: DayScheduleLike | undefined,
+  weekly: WeeklyHours | null | undefined,
+  date: string,
+): { isClosed: boolean; open: Window[]; source: HoursSource } {
+  if (day?.isClosed) return { isClosed: true, open: [], source: "day" };
+  if (day?.slots?.length) {
+    return { isClosed: false, open: day.slots.filter((s) => (s.status ?? "open") === "open").map((s) => ({ start: s.start, end: s.end })), source: "day" };
+  }
+  const w = weekly?.[weekdayKey(date)];
+  if (w) return w.closed ? { isClosed: true, open: [], source: "weekly" } : { isClosed: false, open: w.slots.map((s) => ({ ...s })), source: "weekly" };
+  return { isClosed: false, open: [{ start: DEFAULT_OPEN, end: DEFAULT_CLOSE }], source: "default" };
+}
+
+const fitsIn = (open: Window[], w: Window) => open.some((o) => toMinutes(o.start) <= toMinutes(w.start) && toMinutes(w.end) <= toMinutes(o.end));
+
+/**
+ * Bookings that a new weekly schedule would leave outside open hours.
+ * Only bookings on dates WITHOUT their own day schedule depend on weekly
+ * hours; the caller passes open (pending/confirmed, not expired) bookings.
+ */
+export function strandedByWeekly(
+  bookings: { date: string; start: string; end: string }[],
+  dayDocs: Map<string, DayScheduleLike | undefined>,
+  next: WeeklyHours | null,
+): { date: string; start: string; end: string }[] {
+  return bookings.filter((b) => {
+    const { isClosed, open } = effectiveHours(dayDocs.get(b.date), next, b.date);
+    return isClosed || !fitsIn(open, b);
+  });
+}

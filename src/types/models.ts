@@ -20,6 +20,7 @@ import type { Timestamp } from "firebase/firestore";
 
 import type { CategorySlug } from "@/config/categories";
 import type { LocationSlug } from "@/config/locations";
+import type { WeeklyHours } from "@/lib/booking/rules";
 import type { BasisPoints, Currency, MinorUnits } from "@/lib/money";
 
 import type { MediaAsset } from "./media";
@@ -99,6 +100,12 @@ export interface StudioDoc extends Timestamps {
   listingStatus: StudioListingStatus;
   /** Set by the server when an admin publishes the studio. */
   publishedAt: Timestamp | null;
+  /**
+   * Standard weekly opening hours (Phase 4B-4), public marketplace info.
+   * Written only by the server (PUT /api/studios/{id}/weekly-hours); null or
+   * missing → default hours every day. A date's own schedule overrides it.
+   */
+  weeklyHours?: WeeklyHours | null;
   /** Lowest active package price, maintained server-side for budget filters. */
   startingPrice: MinorUnits | null;
   currency: Currency;
